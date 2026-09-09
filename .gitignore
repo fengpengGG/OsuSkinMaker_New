@@ -9,6 +9,8 @@ settings/
 temp/
 # 调试会话残留（TRAE-debugger 产物：日志/env）
 .dbg/
+# 测试用皮肤素材（不进版本库）
+/src/skins_test/
 # 原项目参考（克隆自 GitHub，不必随本地上传；如想保留作参考可删除此行）
 /OsuSkinMaker/
 # IDE/系统
