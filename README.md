@@ -82,6 +82,9 @@ npm run tauri dev    # 启动 dev server + Rust 窗口（构建第一个窗口�
 
 **或者下载压缩包点击应用程序启动**
 
+<img width="242" height="235" alt="image" src="https://github.com/user-attachments/assets/a3306028-f6ff-4e83-bdb8-5b41c555ba21" />
+
+
 ## 构建打包
 
 ```bash
