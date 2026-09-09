@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OsuSkinMaker v0.1.0</title>
+  <link rel="stylesheet" href="./css/style.css" />
+</head>
+<body>
+  <!-- 工具栏 -->
+  <header id="toolbar">
+    <div class="toolbar-group">
+      <button id="btn-open" class="btn btn-tool">打开皮肤</button>
+      <button id="btn-new" class="btn btn-tool">新建</button>
+      <button id="btn-save" class="btn btn-accent">保存</button>
+      <button id="btn-folder" class="btn btn-tool">文件夹</button>
+      <button id="btn-ini" class="btn btn-tool">打开 skin.ini</button>
+    </div>
+    <div class="toolbar-group">
+      <button id="btn-settings" class="btn btn-tool">设置</button>
+    </div>
+    <div id="path-card" class="path-card" title="">（未打开皮肤）</div>
+  </header>
+
+  <!-- 主区：左预览 / 右面板 -->
+  <main id="main">
+    <section id="preview-pane"></section>
+
+    <section id="side-pane">
+      <nav id="side-tabs" class="tabs">
+        <button class="tab active" data-tab="panel-tab">元素管理</button>
+        <button class="tab" data-tab="ini-tab">skin.ini 编辑</button>
+      </nav>
+      <div id="panel-tab" class="tab-body active"></div>
+      <div id="ini-tab" class="tab-body hidden"></div>
+    </section>
+  </main>
+
+  <!-- 弹窗容器 -->
+  <div id="modal-root"></div>
+
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>

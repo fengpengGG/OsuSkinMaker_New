@@ -1,0 +1,29 @@
+[package]
+name = "OsuSkinMaker"
+version = "0.1.0"
+description = "osu! 皮肤制作工具（Tauri v2）"
+edition = "2021"
+
+[lib]
+name = "osuskin_maker_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+encoding_rs = "0.8"
+encoding_rs_io = "0.1"
+# 素材兼容：将 TIFF 等非 Web 格式的皮肤图转码为 PNG（default-features 关闭以减小体积）
+image = { version = "0.25", default-features = false, features = ["png", "tiff"] }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

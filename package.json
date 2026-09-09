@@ -1,0 +1,14 @@
+{
+  "name": "osuskin-maker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "osu! 皮肤制作工具 (Tauri v2 + 原生 JS)",
+  "type": "module",
+  "scripts": {
+    "dev:server": "node dev-server.mjs",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
