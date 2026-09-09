@@ -4,6 +4,9 @@
 
 **使用的话要备份皮肤文件，备份，备份，备份！！！**
 
+<img width="2047" height="1097" alt="image" src="https://github.com/user-attachments/assets/691d8a48-98d2-4be3-a350-bbe5f8e1baf2" />
+
+
 > 本项目由上一代的 **Python / tkinter 版** **`OsuSkinMaker`**（[上一版 GitHub 仓库](https://github.com/fengpengGG/OsuSkinMaker)）**重写迁移**而来。
 > 迁移到 **Rust + Tauri v2 + WebView2**，前端改用 **原生 vanilla JS/CSS**，核心逻辑（skin.ini 解析、元素分类、皮肤文件扫描）沿用迁移前的代码思路平移实现。
 
