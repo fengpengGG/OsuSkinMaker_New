@@ -660,6 +660,13 @@ async function _browseFile(cmd, input) {
   }
   state.dirty = true;
   emit("ini:changed");
+
+  // 复制模式：新文件已落地，此时 state.ini 也写入了新路径，再重扫皮肤。
+  // 这样 skin:reloaded → reloadAll 会从 state.ini 读到新值，字段立即同步显示新路径
+  // （而非在写值前重扫导致字段被刷回旧值/空）。
+  if (mode === "copy") {
+    try { await rescanSkin(); } catch (e) { /* 重扫失败不阻断 */ }
+  }
 }
 
 // 复制模式下，把同组字体后缀（0-9/comma/dot/percent/x）的文件一并纳入复制集合。
@@ -730,10 +737,9 @@ async function _copyToSkin(srcs, folder, copyFolderName) {
   if (srcs.length > 1) {
     toast("已把同组字体一并复制到 " + copyFolderName + "/：" + copied.sort().join("、"));
   }
-  // 复制产生了新文件：重新扫描皮肤，让游玩预览 / 元素管理立即识别（免手动刷新）
-  if (copied.length) {
-    try { await rescanSkin(); } catch (e) { /* 重扫失败不阻断 */ }
-  }
+  // 复制产生了新文件：重新扫描皮肤，让游玩预览 / 元素管理立即识别（免手动刷新）。
+  // 注意：不在本函数内 rescan——必须等 _browseFile 先把新路径写入 state.ini 再重扫，
+  // 否则 skin:reloaded → reloadAll 会把字段刷回旧值/空，且 Mania 重建 DOM 后写值丢失。
   return true;
 }
 
