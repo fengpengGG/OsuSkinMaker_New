@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 
 use encoding_rs::Encoding;
 use serde::Serialize;
-use tauri::Manager;
 
 const IMAGE_EXTS: [&str; 4] = [".png", ".gif", ".jpg", ".jpeg"];
 
@@ -79,11 +78,6 @@ const GBK: &'static Encoding = encoding_rs::GBK;
 pub struct ReadTextResult {
     pub text: String,
     pub encoding: String,
-}
-
-#[derive(Serialize)]
-pub struct WriteResult {
-    pub ok: bool,
 }
 
 /// 读取文本文件并检测编码。

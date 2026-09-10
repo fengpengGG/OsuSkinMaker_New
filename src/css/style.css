@@ -12,7 +12,14 @@
   --radius-sm: 8px;
   --shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
   --font: "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
+
+  /* UI 大小缩放：html 缩放，弹窗/toast 反向抵消，保证始终留在视口内可操作 */
+  --ui-scale: 1;
+  --ui-inv: 1;
 }
+
+html { zoom: var(--ui-scale); }
+#modal-root, #toast-root { zoom: var(--ui-inv); }
 
 body.dark {
   --bg: #12121a;
@@ -133,7 +140,7 @@ body {
 /* ============================ 主区布局 ============================ */
 #main {
   display: flex;
-  gap: 12px;
+  gap: 4px;
   padding: 12px;
   height: calc(100% - 62px);
   min-height: 0;
@@ -373,6 +380,11 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .modal-label { font-size: 13px; margin-bottom: 6px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 .modal-actions .btn { padding: 6px 16px; }
+.modal-box > .modal-actions {
+  margin: 0; padding: 10px 16px;
+  border-top: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.03);
+}
 
 .text-input {
   width: 100%;
@@ -390,6 +402,12 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .settings-card-title { font-weight: 700; font-size: 14px; margin-bottom: 2px; }
 .settings-card-desc { font-size: 12px; color: var(--text-secondary); margin-bottom: 8px; }
 .opt-row { display: flex; flex-wrap: wrap; gap: 8px 18px; }
+/* 选中高亮框设置：开关 + 色块同排 */
+.hitbox-row { align-items: center; gap: 10px; }
+.hitbox-row input[type="color"] { width: 34px; height: 22px; padding: 0; border: 1px solid var(--border); border-radius: 4px; background: none; cursor: pointer; }
+/* UI 大小缩放：滑条弹性 + 数值输入框固定宽 */
+.ui-scale-row { align-items: center; gap: 12px; }
+.ui-scale-row input[type="range"] { flex: 1; min-width: 120px; }
 .opt { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; font-size: 13px; padding: 3px 0; }
 .opt.checkbox { display: block; margin: 6px 0; }
 .opt input { accent-color: var(--accent); cursor: pointer; }

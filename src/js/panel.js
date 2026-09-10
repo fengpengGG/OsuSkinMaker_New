@@ -260,6 +260,8 @@ export function renderPanel() {
   on("preview:element-selected", selectElement);
   // 重扫皮肤（含复制添加素材后的 rescanSkin）→ 自动刷新元素管理树，免手动刷新
   on("skin:reloaded", refreshPanel);
+  // 设置变更（如"元素管理按当前预览界面分类显示"开关）→ 立即刷新树
+  on("settings:changed", refreshPanel);
 }
 
 export function refreshPanel() {
@@ -347,7 +349,7 @@ export function refreshPanel() {
     const item = tree.querySelector(`[data-filename="${CSS.escape(_p.selected)}"]`);
     if (item) {
       item.classList.add("selected");
-      item.scrollIntoView({ block: "nearest" });
+      _reveal(item);
     } else {
       _p.selected = null;
     }
@@ -401,6 +403,16 @@ function _makeItem(e, st) {
 // 选中与预览
 // ---------------------------------------------------------------------------
 
+// 展开 item 的所有父级 <details>（分类栏），随后滚动定位，确保组件可见。
+function _reveal(item) {
+  let node = item;
+  while (node && node !== document) {
+    if (node.tagName === "DETAILS" && !node.open) node.open = true; // 触发 toggle → 自动保存展开状态
+    node = node.parentElement;
+  }
+  item.scrollIntoView({ block: "nearest" });
+}
+
 export function selectElement(filename) {
   _p.selected = filename;
   // 若当前不在列表中（被筛选/页面过滤）：重置筛选并刷新
@@ -417,7 +429,7 @@ export function selectElement(filename) {
   if (tree && item) {
     tree.querySelectorAll(".tree-item.selected").forEach((x) => x.classList.remove("selected"));
     item.classList.add("selected");
-    item.scrollIntoView({ block: "nearest" });
+    _reveal(item);
   }
   _updatePreview(filename);
 }

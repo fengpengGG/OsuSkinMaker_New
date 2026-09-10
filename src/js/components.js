@@ -21,6 +21,11 @@ export function makeSplitter(parent, left, right, {
   bar.className = "splitter splitter-v";
   bar.title = "拖拽调整宽度";
 
+  // UI zoom（html 缩放）≠1 时，getBoundingClientRect 返回物理像素。
+  // 而 clientWidth / style.width 是 CSS 像素，两者需统一；否则拖拽会偏移并回弹。
+  const zoom = () => parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--ui-scale")) || 1;
+  const cssW = (el) => el.getBoundingClientRect().width / zoom();
+
   // 读取持久化比例（settings.json 优先，旧 localStorage 值兜底）
   let ratio = null;
   if (ratioKey) {
@@ -57,7 +62,7 @@ export function makeSplitter(parent, left, right, {
     let w = null;
     if (persistKey) { try { w = parseFloat(localStorage.getItem(persistKey)); } catch (_e) {} }
     if (!w && initial != null) w = initial;
-    if (!w) w = left.getBoundingClientRect().width || Math.round(parent.clientWidth * 0.6);
+    if (!w) w = cssW(left) || Math.round(parent.clientWidth * 0.6);
     if (!w) w = 360;
     apply(w, false);
   };
@@ -75,13 +80,13 @@ export function makeSplitter(parent, left, right, {
     document.removeEventListener("mousemove", onMove);
     document.removeEventListener("mouseup", onUp);
     // 拖拽结束：保存当前比例
-    apply(left.getBoundingClientRect().width, true);
+    apply(cssW(left), true);
   };
   bar.addEventListener("mousedown", (e) => {
     e.preventDefault();
     dragging = true;
     startX = e.clientX;
-    startLeft = left.getBoundingClientRect().width;
+    startLeft = cssW(left);
     document.body.classList.add("resizing-col");
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mouseup", onUp);
@@ -102,7 +107,7 @@ export function makeSplitter(parent, left, right, {
 
 // -- 通用模态框 ------------------------------------------------------------
 
-export function modal({ title = "", bodyEl, width = 460, maxHeight = "90vh" }) {
+export function modal({ title = "", bodyEl, width = 460, maxHeight = "90vh", footerEl = null, onOverlay = null }) {
   const root = document.getElementById("modal-root");
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
@@ -125,6 +130,7 @@ export function modal({ title = "", bodyEl, width = 460, maxHeight = "90vh" }) {
   box.appendChild(head);
   box.appendChild(body);
   if (bodyEl) body.appendChild(bodyEl);
+  if (footerEl) box.appendChild(footerEl);
   overlay.appendChild(box);
   root.appendChild(overlay);
 
@@ -134,7 +140,10 @@ export function modal({ title = "", bodyEl, width = 460, maxHeight = "90vh" }) {
     if (_resolvedClose) _resolvedClose();
   };
   overlay.addEventListener("mousedown", (e) => {
-    if (e.target === overlay) close();
+    if (e.target === overlay) {
+      if (onOverlay) onOverlay();
+      else close();
+    }
   });
   return { el: box, body, close, onClosed: () => new Promise((r) => (_resolvedClose = r)) };
 }
@@ -281,6 +290,7 @@ function card(title, desc, children) {
 
 export function openSettings() {
   const s = state.settings;
+  const snapshot = JSON.parse(JSON.stringify(s));
   const scroll = document.createElement("div");
   scroll.className = "modal-scroll";
 
@@ -327,6 +337,39 @@ export function openSettings() {
   ]));
 
   // 预览显示
+  // rgba → hex（供 color input 回显）；hex → 保持原 rgba 透明度
+  const hitHex = (() => {
+    const m = String(s.hitbox_color || "").match(/rgba?\(([^)]+)\)/);
+    if (m) {
+      const p = m[1].split(",").map((x) => parseFloat(x.trim()));
+      const f = (n) => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, "0");
+      return "#" + f(p[0]) + f(p[1]) + f(p[2]);
+    }
+    return "#40c8ff";
+  })();
+  const hitRow = document.createElement("div");
+  hitRow.className = "opt-row hitbox-row";
+  const hitToggle = checkBox("显示选中组件的高亮框", s.hitbox_show, async (v) => {
+    state.settings.hitbox_show = v;
+    colorInput.disabled = !v;
+    await markChange(); // markChange → emit settings:changed → 预览重绘
+  });
+  const colorInput = document.createElement("input");
+  colorInput.type = "color";
+  colorInput.value = hitHex;
+  colorInput.disabled = !s.hitbox_show;
+  colorInput.title = "高亮框颜色";
+  const applyColor = async (hex) => {
+    const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+    // 保留原 alpha（默认 0.9）；纯 rgb 字符串则给 0.9
+    const m = String(state.settings.hitbox_color || "").match(/rgba?\(([^)]+)\)/);
+    const a = m && state.settings.hitbox_color.match(/rgba/) ? (parseFloat(m[1].split(",")[3]) || 1) : 0.9;
+    state.settings.hitbox_color = `rgba(${r}, ${g}, ${b}, ${a})`;
+    await markChange(); // → emit settings:changed → 预览重绘
+  };
+  colorInput.addEventListener("input", () => applyColor(colorInput.value));
+  hitRow.appendChild(hitToggle);
+  hitRow.appendChild(colorInput);
   scroll.appendChild(card("预览显示", "游玩预览中缺失组件的显示与交互方式", [
     checkBox("缺失的组件显示默认组件", s.show_default, async (v) => {
       state.settings.show_default = v; await markChange();
@@ -334,11 +377,74 @@ export function openSettings() {
     checkBox("点击预览中的组件联动选中元素管理中的对应元素", s.click_select, async (v) => {
       state.settings.click_select = v; await markChange();
     }),
+    hitRow,
     checkBox("元素管理按当前预览界面分类显示", s.enable_category, async (v) => {
       state.settings.enable_category = v; await markChange();
     }),
   ]));
 
-  const m = modal({ title: "设置", bodyEl: scroll, width: 620 });
+  // UI 大小（界面整体缩放）
+  const scaleRow = document.createElement("div");
+  scaleRow.className = "opt-row ui-scale-row";
+  const scaleRange = document.createElement("input");
+  scaleRange.type = "range";
+  scaleRange.min = "0.7"; scaleRange.max = "1.5"; scaleRange.step = "0.05";
+  scaleRange.value = String(s.ui_scale ?? 1);
+  const scaleVal = document.createElement("input");
+  scaleVal.type = "number";
+  scaleVal.className = "text-input inline";
+  scaleVal.min = "0.7"; scaleVal.max = "1.5"; scaleVal.step = "0.05";
+  scaleVal.value = String(Number(scaleRange.value).toFixed(2));
+  const setScale = (v) => {
+    const n = Number(v);
+    const c = Math.min(1.5, Math.max(0.7, Number.isFinite(n) ? n : 1));
+    scaleVal.value = c.toFixed(2);
+    state.settings.ui_scale = c;
+    // 与 app.js applyUiScale 保持一致：只更新 CSS 变量，弹窗/toast 自动反向抵消
+    const r = document.documentElement.style;
+    r.setProperty("--ui-scale", String(c));
+    r.setProperty("--ui-inv", String(1 / c));
+  };
+  scaleRange.addEventListener("input", () => setScale(scaleRange.value));
+  scaleRange.addEventListener("change", async () => { await markChange(); });
+  scaleVal.addEventListener("change", () => { setScale(scaleVal.value); markChange(); });
+  scaleRow.append(scaleRange, scaleVal);
+  scroll.appendChild(card("UI 大小", "整体界面缩放（0.7 ~ 1.5）", [scaleRow]));
+
+  // 底部操作栏：取消（回滚快照）/ 确认（保存并关闭）
+  const footer = document.createElement("div");
+  footer.className = "modal-actions";
+  const cancelBtn = document.createElement("button");
+  cancelBtn.className = "btn btn-tool";
+  cancelBtn.textContent = "取消";
+  const okBtn = document.createElement("button");
+  okBtn.className = "btn btn-accent";
+  okBtn.textContent = "确认";
+  footer.append(cancelBtn, okBtn);
+
+  const m = modal({
+    title: "设置", bodyEl: scroll, width: 620, footerEl: footer,
+    // 点击弹窗外部（遮罩）＝取消：回滚设置后关闭
+    onOverlay: () => cancelBtn.click(),
+  });
+
+  cancelBtn.onclick = async () => {
+    // 回滚：把设置恢复为打开时的快照，并重新应用实时生效的项
+    Object.keys(snapshot).forEach((k) => {
+      state.settings[k] = snapshot[k];
+    });
+    emit("theme:changed");
+    const r = document.documentElement.style;
+    const v = Math.min(1.5, Math.max(0.7, Number(state.settings.ui_scale) || 1));
+    r.setProperty("--ui-scale", String(v));
+    r.setProperty("--ui-inv", String(1 / v));
+    await persistSettings();
+    emit("settings:changed");
+    m.close();
+  };
+  okBtn.onclick = async () => {
+    await persistSettings();
+    m.close();
+  };
   return m;
 }

@@ -80,6 +80,7 @@ let _p = {
   pickables: [],    // 本次绘制可点击元素 {filename, x, y, w, h}（绘制顺序 = 底层→顶层）
   hitStackKey: null, // 最近一次单击命中集的稳定键（供双击逐层向下）
   hitIdx: -1,
+  hitPick: null,      // 当前选中的命中元素（用于绘制高亮框）
   imgCache: new Map(),   // path -> {img, w, h, failed}（w/h 为 @2x 减半后的 1x 逻辑尺寸）
   tintCache: new Map(),  // img + rgb -> 着色后的 canvas
   holdCache: new Map(),  // 长条 body 合成图缓存
@@ -965,7 +966,13 @@ function _draw(ctx, cw, ch) {
     const sw = sr - sl;
     const hEnt = hintPath ? _imgEntLoaded(hintPath) : null;
     if (hEnt && hEnt.w > 0) {
-      const th = Math.max(1, Math.round(hEnt.h * sw * scale / hEnt.w));
+      // 判定线高度按图片宽高比缩放，但 1x1 占位图会把高度撑成与宽度等大
+      // （th = sw*scale 的巨大方形），既影响观感也导致框选范围/高亮框错误。
+      // 故限制高度不超过一个合理上限（按舞台宽的 20%，通常判定线远细于此）。
+      const th = Math.max(1, Math.min(
+        Math.round(hEnt.h * sw * scale / hEnt.w),
+        Math.round(sw * scale * 0.2),
+      ));
       const cx = X((sl + sr) / 2) - sw * scale / 2;
       const cy = Y(hitY) - th / 2;
       _drawEnt(hEnt, cx, cy, sw * scale, th);
@@ -1231,6 +1238,16 @@ function _doDraw() {
   } catch (e) {
     console.error("[preview] 绘制失败", e);
   }
+  // 当前选中图层高亮框（点击/双击下钻后的视觉反馈；可在设置中开关/改色）
+  const hp = _p.hitPick;
+  if (hp && state.settings.click_select && state.settings.hitbox_show) {
+    ctx.save();
+    ctx.strokeStyle = state.settings.hitbox_color;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([5, 3]);
+    ctx.strokeRect(hp.x, hp.y, hp.w, hp.h);
+    ctx.restore();
+  }
   ctx.restore();
 }
 
@@ -1252,7 +1269,9 @@ function _hitsKey(hits) {
 }
 
 function _selectPick(pk) {
+  _p.hitPick = pk;
   emit("preview:element-selected", pk.filename);
+  _scheduleDraw(); // 绘制选中高亮框
 }
 
 function _onCanvasClick(e) {

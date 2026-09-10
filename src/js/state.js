@@ -37,6 +37,11 @@ const DEFAULT_SETTINGS = {
   enable_category: true,
   ini_import_mode: "path",
   ini_import_folder: "mania",
+  // UI 缩放比例 (0.7 ~ 1.5)：对整个界面做 zoom 缩放
+  ui_scale: 1,
+  // 预览选中图层高亮框：是否显示 + 颜色（rgba 字符串）
+  hitbox_show: true,
+  hitbox_color: "rgba(64, 200, 255, 0.9)",
   // 窗口状态（与原项目字段一致）：无记录时默认最大化
   window_state: "zoomed",  // "zoomed" | "normal"
   window_geometry: null,   // { width, height, x, y } 物理像素
@@ -81,12 +86,17 @@ function _sanitize(settings) {
   if (typeof out.show_default !== "boolean") {
     out.show_default = Boolean(out.missing_block ?? true);
   }
+  const _scale = Number(out.ui_scale);
+  out.ui_scale = Number.isFinite(_scale) ? Math.min(1.5, Math.max(0.7, _scale)) : 1;
   for (const key of ["hd_default", "ini_import_mode", "theme"]) {
     const list = VALID[key];
     if (list && !list.includes(out[key])) out[key] = { ...DEFAULT_SETTINGS }[key];
   }
-  for (const key of ["show_default", "click_select", "enable_category"]) {
+  for (const key of ["show_default", "click_select", "enable_category", "hitbox_show"]) {
     out[key] = Boolean(out[key]);
+  }
+  if (typeof out.hitbox_color !== "string" || !out.hitbox_color) {
+    out.hitbox_color = DEFAULT_SETTINGS.hitbox_color;
   }
   if (typeof out.preview !== "object" || !out.preview) out.preview = { ...state.preview };
   else out.preview = { ...state.preview, ...out.preview };

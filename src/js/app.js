@@ -23,6 +23,16 @@ export function applyTheme(name) {
   document.body.classList.toggle("light", !dark);
 }
 
+// 对整个界面做 zoom 缩放（WebView2/Chromium 支持），实现"UI 大小"调节。
+// 只更新 CSS 变量：html 由 --ui-scale 缩放，弹窗/toast 由 --ui-inv 反向抵消，
+// 保证在任意 UI 大小下弹窗与 toast 都完整留在视口内可操作。
+export function applyUiScale(scale) {
+  const v = Math.min(1.5, Math.max(0.7, Number(scale) || 1));
+  const r = document.documentElement.style;
+  r.setProperty("--ui-scale", String(v));
+  r.setProperty("--ui-inv", String(1 / v));
+}
+
 // ---------------------------------------------------------------------------
 // 工具栏动作
 // ---------------------------------------------------------------------------
@@ -147,7 +157,11 @@ let _closing = false;
 
 async function init() {
   applyTheme(state.settings.theme || "dark");
-  on("settings:loaded", (s) => applyTheme(s.theme));
+  applyUiScale(state.settings.ui_scale);
+  on("settings:loaded", (s) => {
+    applyTheme(s.theme);
+    applyUiScale(s.ui_scale);
+  });
   on("theme:changed", () => {
     applyTheme(state.settings.theme);
     persistSettings();
