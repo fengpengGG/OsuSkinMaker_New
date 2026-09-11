@@ -330,6 +330,18 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .preview-aspect { display: inline-flex; gap: 2px; align-items: center; font-size: 12px; color: var(--text-secondary); }
 .preview-aspect .btn.active { background: var(--accent-gradient); color: #fff; }
 .preview-btn-sm { padding: 4px 10px; font-size: 12px; }
+/* 对局预览控制行 */
+.preview-play {
+  display: flex; align-items: center; gap: 8px; flex: 1 1 100%;
+  padding: 6px 10px; border-top: 1px solid var(--border);
+  flex-wrap: nowrap; min-width: 0;
+}
+.preview-play-title { flex: 1 1 60%; min-width: 0; font-size: 12px; color: var(--text-primary);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.preview-progress { flex: 3 1 120px; accent-color: #7c6cff; cursor: pointer; }
+.preview-play-time { font-size: 12px; color: var(--text-secondary); white-space: nowrap; }
+.preview-speed { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--text-secondary); }
+.preview-speed .field-select { max-width: 68px; padding: 2px 6px; }
 .preview-canvas-wrap { flex: 1; position: relative; background: var(--canvas); overflow: hidden; }
 .preview-canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
 .preview-info {

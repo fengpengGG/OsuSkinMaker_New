@@ -22,6 +22,7 @@ pub fn run() {
             commands::delete_file,
             commands::create_folder,
             commands::open_in_explorer,
+            commands::find_file_by_name,
             commands::open_with_default_app,
             commands::pick_folder,
             commands::pick_files,

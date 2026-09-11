@@ -5,11 +5,12 @@
 // 皮肤图片经后端 base64（loadImageSrc）加载，@2x 按官方规则减半为 1x 逻辑尺寸。
 
 import { state, on, emit, persistSettings, rescanSkin } from "./state.js";
-import { loadImageSrc } from "./api.js";
+import { loadImageSrc, invoke } from "./api.js";
 import { SkinManager } from "./manager.js";
 import { NOTE_LAYOUT, findManiaSection } from "./skin_ini.js";
 import { _num, _num_list, _choice, rgb_to_hex } from "./utilities.js";
-import { modal } from "./components.js";
+import { modal, toast } from "./components.js";
+import { parseOsuBeatmap, bisectLeft } from "./osu_parser.js";
 
 // ---------------------------------------------------------------------------
 // 常量（与 Python 版一致）
@@ -63,7 +64,13 @@ const FAIL_BUTTONS = [
 
 const MAGIC_SCALE = 1.6; // x768(SD) → x480 预览换算
 
-const PAGES = ["游玩界面", "暂停界面", "失败界面", "成绩结算界面", "选歌界面"];
+const PAGES = ["游玩界面", "暂停界面", "失败界面", "成绩结算界面", "选歌界面", "对局预览"];
+
+// 对局预览滚动参数：visibleMs = 11485 / 下落速度（参考 Beatmap_Preview_v 的
+// BASE_MS_VISIBLE=11485，speed 1~40，数字越大 note 下落越快）。
+const PLAY_BASE_MS_VISIBLE = 11485;
+const PLAY_HIT_FLASH = 180;     // 打击后按键/灯光/判定反馈保留时长（ms）
+const PLAY_SPEED_MIN = 1, PLAY_SPEED_MAX = 40;
 
 // ---------------------------------------------------------------------------
 // 模块内部状态
@@ -87,6 +94,7 @@ let _p = {
   digitCache: new Map(), // (prefix, ch) -> 数字皮肤图路径
   timer: 0,
   resizeObs: null,
+  play: null,            // 对局预览状态（见 _playReset）
 };
 
 // ---------------------------------------------------------------------------
@@ -631,12 +639,500 @@ function _drawPlaySkip(sx, sy, screenW, screenH, scale) {
 }
 
 // ---------------------------------------------------------------------------
+// 对局预览：按时间驱动的动态下落渲染
+// ---------------------------------------------------------------------------
+
+function _playReset() {
+  _p.play = {
+    bm: null,        // 解析后的谱面
+    keys: 4,         // 谱面键数（Clamp 到 [1,18]）
+    audio: null,     // HTMLAudioElement
+    audioUrl: null,
+    playing: false,
+    raf: 0,
+    last: undefined, // 上一帧时间（手动时钟用）
+    manualMs: 0,     // 无音频时的节目时间（ms）
+    speed: 25,       // 下落速度（1~40，越大下落越快，参考 Beatmap_Preview_v）
+    // 进度条缓存（避免每帧重建）
+    playBtn: null, progress: null, speedSel: null, timeLbl: null, titleLbl: null, ctl: null,
+  };
+  return _p.play;
+}
+
+/** 当前音乐绝对时间（ms）：有音频读 audio.currentTime，否则用手动时钟。 */
+function _playTimeMs() {
+  const p = _p.play;
+  if (!p) return 0;
+  if (p.audio && isFinite(p.audio.currentTime)) return p.audio.currentTime * 1000;
+  return p.manualMs;
+}
+
+function _playDurMs() {
+  const p = _p.play;
+  if (!p || !p.bm) return 0;
+  const audioDur = p.audio && isFinite(p.audio.duration) ? p.audio.duration * 1000 : 0;
+  return Math.max(audioDur, p.bm.durationMs, 1);
+}
+
+function _playVisibleMs() {
+  const p = _p.play;
+  const sp = p && p.speed ? p.speed : 1;
+  return PLAY_BASE_MS_VISIBLE / sp;
+}
+
+/** 导入铺面（选择 .osu，音频按 AudioFilename 自动在谱面目录查找；未找到才用多选的音频）。 */
+async function _importBeatmap() {
+  let files = [];
+  try {
+    files = await invoke("pick_files");
+  } catch (e) {
+    toast(`导入铺面失败：${e.message || e}`, "error");
+    return;
+  }
+  const osuPath = files.find((f) => /\.osu$/i.test(f));
+  if (!osuPath) { toast("未选择 .osu 谱面文件", "error"); return; }
+  let osuText;
+  try {
+    const r = await invoke("read_text", { path: osuPath });
+    osuText = r && r.text;
+  } catch (e) { toast(`读取谱面失败：${e.message || e}`, "error"); return; }
+  if (!osuText || !osuText.includes("[HitObjects]")) { toast("谱面文件无效（缺少 [HitObjects]）", "error"); return; }
+
+  let bm;
+  try { bm = parseOsuBeatmap(osuText); }
+  catch (e) { toast(`解析谱面失败：${e.message || e}`, "error"); return; }
+  if (bm.mode !== 3) { toast("非 osu!mania 谱面（未支持其他模式）", "error"); return; }
+
+  const p = _p.play || _playReset();
+  // 释放旧音频
+  if (p.audio) { p.audio.pause(); p.audio = null; }
+  if (p.audioUrl) { URL.revokeObjectURL(p.audioUrl); p.audioUrl = null; }
+  p.bm = bm;
+  p.keys = Math.max(1, Math.min(18, bm.circleSize));
+  p.playing = false;
+  p.manualMs = 0;
+  p.last = undefined;
+
+  // 音频：优先按 AudioFilename 在谱面目录（递归）查找；找不到则用文件对话框里一并选的
+  let audioPath = null;
+  const dir = osuPath.replace(/[\\/][^\\/]*$/, "");
+  if (bm.audioFilename) {
+    try { audioPath = await invoke("find_file_by_name", { folder: dir, name: bm.audioFilename }); }
+    catch (e) { audioPath = null; }
+  }
+  if (!audioPath) {
+    audioPath = files.find((f) => /\.(mp3|ogg|wav|mp4|m4a|flac|aac)$/i.test(f)) || null;
+  }
+  if (audioPath) {
+    try {
+      const bytes = await invoke("read_file_bytes", { path: audioPath });
+      if (bytes && bytes.byteLength) {
+        p.audioUrl = URL.createObjectURL(new Blob([bytes]));
+        const a = new Audio(p.audioUrl);
+        a.preload = "auto";
+        a.addEventListener("ended", _playOnEnded);
+        p.audio = a;
+      }
+    } catch (e) { toast(`音频加载失败：${e.message || e}`, "error"); }
+  }
+
+  toast(`已导入：${bm.title}（${p.keys}K / ${Math.round(bm.bpm)}BPM / ${bm.noteCount} 音符${bm.lnCount ? " +" + bm.lnCount + " 长条" : ""}${audioPath ? "，已带音频" : "，无音频"}）`);
+  _playSwitchTo("对局预览");
+  _schedulePlayLoop();
+}
+
+function _playToggle() {
+  const p = _p.play;
+  if (!p || !p.bm) return;
+  if (p.playing) _playPause();
+  else _playStart();
+}
+
+function _playStart() {
+  const p = _p.play;
+  if (!p || !p.bm) return;
+  p.playing = true;
+  if (p.audio) {
+    p.audio.play().then(() => {
+      if (!p) return;
+      p.playing = true;
+    }).catch(() => { p.playing = false; });
+  }
+  _schedulePlayLoop();
+}
+
+function _playPause() {
+  const p = _p.play;
+  if (!p) return;
+  p.playing = false;
+  if (p.audio) p.audio.pause();
+}
+
+function _playOnEnded() {
+  const p = _p.play;
+  if (!p) return;
+  p.playing = false;
+}
+
+function _playSeek(ms) {
+  const p = _p.play;
+  if (!p || !p.bm) return;
+  ms = Math.max(0, Math.min(ms, _playDurMs()));
+  p.manualMs = ms;
+  if (p.audio) {
+    try { p.audio.currentTime = ms / 1000; } catch (e) { /* ignore */ }
+  }
+}
+
+function _playSetSpeed(sp) {
+  const p = _p.play;
+  if (!p) return;
+  // 下落速度（1~40）：只影响 note 可见窗口（visibleMs），不影响音乐播放速度
+  const n = parseInt(sp, 10);
+  p.speed = Math.max(PLAY_SPEED_MIN, Math.min(PLAY_SPEED_MAX, isNaN(n) ? 25 : n));
+  if (p.speedSel) p.speedSel.value = String(p.speed);
+}
+
+function _schedulePlayLoop() {
+  if (!_p.play) return;
+  if (_p.play.raf) return;
+  cancelAnimationFrame(_p.play.raf);
+  _p.play.raf = 0;
+  _p.play.last = undefined;
+  _playLoop();
+}
+
+function _stopPlayLoop() {
+  if (_p.play && _p.play.raf) { cancelAnimationFrame(_p.play.raf); _p.play.raf = 0; }
+}
+
+/** 对局循环：推进时间、刷新进度 UI、逐帧重绘。 */
+function _playLoop() {
+  const p = _p.play;
+  if (!p || !_p.canvas) return;
+  if (_pv("page", "游玩界面") !== "对局预览") {
+    p.raf = 0; // 页面已离开对局预览，停止循环
+    return;
+  }
+
+  // 推进时间（speed 只影响下落可见窗口，音乐/时钟始终正常速度）
+  if (p.playing) {
+    const now = performance.now();
+    if (p.last !== undefined) {
+      if (!p.audio) p.manualMs += now - p.last;
+      if (_playTimeMs() >= _playDurMs()) {
+        p.playing = false;
+        if (p.audio) p.audio.pause();
+      }
+    }
+    p.last = now;
+  } else {
+    p.last = undefined;
+  }
+
+  _updatePlayUI();
+  _doDraw();
+  if (p.raf) p.raf = 0;
+  p.raf = requestAnimationFrame(_playLoop);
+}
+
+function _fmtMs(ms) {
+  ms = Math.max(0, Math.floor(ms / 1000));
+  return `${Math.floor(ms / 60)}:${String(ms % 60).padStart(2, "0")}`;
+}
+
+function _updatePlayUI() {
+  const p = _p.play;
+  if (!p) return;
+  const cur = Math.min(_playTimeMs(), _playDurMs());
+  if (p.progress) {
+    p.progress.max = String(_playDurMs());
+    p.progress.value = String(cur);
+  }
+  if (p.timeLbl) p.timeLbl.textContent = `${_fmtMs(cur)} / ${_fmtMs(_playDurMs())}`;
+  if (p.playBtn) p.playBtn.textContent = p.playing ? "⏸ 暂停" : "▶ 播放";
+  if (p.titleLbl && p.bm) {
+    p.titleLbl.textContent = `${p.bm.title} ｜ ${p.bm.creator ? p.bm.creator + " / " : ""}${p.bm.version}（${p.bm.keys}K, BPM ${Math.round(p.bm.bpm)}）`;
+  }
+}
+
+function _playIsActive() {
+  return !!(_p.play && _p.play.bm && _pv("page", "游玩界面") === "对局预览");
+}
+
+/**
+ * 动态对局渲染：画轨道上的基键、按下键、打击灯光、判定反馈，
+ * 以及按时间下落的普通音符与 LN（头/身体/尾），参考官方 mania 的 two-phase LN。
+ */
+function _drawPlayNotes(P) {
+  const { ctx, X, Y, scale, cols, keys, vals, layout, flipKeys, flipNotes,
+          upside, hitY, refW, noteBodyStyle } = P;
+  const play = _p.play;
+  const bm = play.bm;
+  const t = _playTimeMs();
+  const visibleMs = _playVisibleMs();
+  const v = hitY / visibleMs; // 单位坐标 / ms
+  const colWpx = (i) => (cols[i][1] - cols[i][0]) * scale;
+  const cxpx = (i) => X((cols[i][0] + cols[i][1]) / 2);
+
+  const keyH = (_img) => { const e = _img; return e && e.h > 0 ? Math.max(1, Math.round(e.h * scale / 1.6)) : 0; };
+
+  // 普通音符图片（非 LN 轨）
+  const normalImg = (i) => {
+    const cmd = `NoteImage${i}`;
+    const fallback = `mania-note${layout[i]}`;
+    const path = _resolvePath(vals.get(cmd), fallback);
+    return path ? _imgEntLoaded(path) : null;
+  };
+  // LN 三件套
+  const lnParts = (i) => {
+    const H = _resolvePath(vals.get(`NoteImage${i}H`), `mania-note${layout[i]}H`);
+    const L = _resolvePath(vals.get(`NoteImage${i}L`), `mania-note${layout[i]}L`);
+    const T = _resolvePath(vals.get(`NoteImage${i}T`), `mania-note${layout[i]}T`);
+    return {
+      H: H ? _imgEntLoaded(H) : null,
+      L: L ? _imgEntLoaded(L) : null,
+      T: T ? _imgEntLoaded(T) : null,
+    };
+  };
+
+  // 用头图/身体存在与否判断该列属于普通还是长条轨道（权重一致即可）；
+  // 具体由谱面对象 type 决定，图片缺失时走默认矩形兜底。
+
+  // ---- 面板预计算每列：最近打击时间、LN 是否按住 ----
+  // （先收集，再统一按“按下时长”画按键/灯光，得到按前/按后反馈）
+  const colPressed = new Array(keys).fill(false);
+  const colHit = new Array(keys).fill(-Infinity);
+
+  const hitIndex = bm.hitIndex;
+  const objs = bm.hitObjects;
+  const winS = t - visibleMs * 0.2;
+  const winE = t + visibleMs;
+  const si = bisectLeft(hitIndex.starts, winS, "t");
+  const ei = bisectLeft(hitIndex.starts, winE, "t");
+
+  // 收集可视对象
+  const notes = [];   // {i, isLn, o}
+  for (let k = si; k < ei; k++) {
+    const s = hitIndex.starts[k];
+    const o = objs[s.idx];
+    const i = Math.floor(o.x * keys / 512);
+    if (i < 0 || i >= keys) continue;
+    const isLn = !!(o.type & 128);
+    notes.push({ i, isLn, o });
+  }
+
+  // LN 按住状态：头已到判定线且未结束 → 按住；结束后沿尾巴保持按键一段
+  const lnHeld = new Array(keys).fill(false);
+
+  // ---- 打击反馈：普通音符到判定线记一次打击 ----
+  for (const n of notes) {
+    if (n.isLn) continue;
+    if (n.o.time <= t && n.o.time >= t - PLAY_HIT_FLASH) colHit[n.i] = Math.max(colHit[n.i], n.o.time);
+  }
+  // LN 头到达判定线 → 按住；尾端滑过判定线 → 记释放时刻，按键保持一段
+  for (const ln of hitIndex.lnEnds) {
+    if (ln.t > t) break;
+    const o = objs[ln.idx];
+    const i = Math.floor(o.x * keys / 512);
+    if (i < 0 || i >= keys) continue;
+    if (o.time <= t) {
+      if (ln.end > t) { lnHeld[i] = true; colHit[i] = Math.max(colHit[i], o.time); }
+      else { colHit[i] = Math.max(colHit[i], ln.end); } // 刚释放 → 保持按下效果
+    }
+  }
+
+  for (let i = 0; i < keys; i++) {
+    colPressed[i] = lnHeld[i] || (t - colHit[i] < PLAY_HIT_FLASH);
+  }
+
+  // ═══════════════════════ 接收器（基键 + 按下键） ═══════════════════════
+  // 始终在所有列画底键；最近打击/按住列叠加按下键（KeyImageND）。
+  for (let i = 0; i < keys; i++) {
+    const [x0, x1] = cols[i];
+    const wpx = colWpx(i);
+    const cx = cxpx(i);
+    const baseCmd = `KeyImage${i}`;
+    const pressedCmd = `KeyImage${i}D`;
+    const basePath = _resolvePath(vals.get(baseCmd), `mania-key${layout[i]}`);
+    const pressPath = _resolvePath(vals.get(pressedCmd), `mania-key${layout[i]}D`);
+    const baseEnt = basePath ? _imgEntLoaded(basePath) : null;
+    const pressEnt = pressPath ? _imgEntLoaded(pressPath) : null;
+
+    // 底键
+    let kh = 0;
+    if (baseEnt && baseEnt.h > 0) {
+      kh = keyH(baseEnt);
+      const y = upside ? Y(480) : Y(480) - kh;
+      _drawEnt(baseEnt, X(x0), y, wpx, kh, false, flipKeys);
+    }
+    // 按下键覆盖
+    if (colPressed[i] && pressEnt && pressEnt.h > 0) {
+      const kh2 = keyH(pressEnt);
+      const y = upside ? Y(480) : Y(480) - kh2;
+      _drawEnt(pressEnt, X(x0), y, wpx, kh2, false, flipKeys);
+    }
+    // 无皮肤底键 → 默认矩形（按下态加深）
+    if (!baseEnt && _showDefaultOn()) {
+      ctx.fillStyle = colPressed[i] ? "#5a5a66" : "#3a3a44";
+      ctx.strokeStyle = "#ffffff";
+      const y0 = Y(hitY), y1 = Y(480);
+      ctx.fillRect(X(x0), y0, wpx, y1 - y0);
+      ctx.strokeRect(X(x0), y0, wpx, y1 - y0);
+    }
+    // 打击灯光（mania-stage-light / lightingN·L），按下列点亮
+    if (colPressed[i] && _showDefaultOn() && i >= (keys >> 1)) {
+      const lightPath = _resolvePath(vals.get("StageLight"), "mania-stage-light");
+      const lightEnt = lightPath ? _imgEntLoaded(lightPath) : null;
+      if (lightEnt) {
+        const tinted = _tintEl(lightEnt.img, _parseRgba(vals.get(`ColourLight${i + 1}`), [55, 255, 255, 255]).slice(0, 3));
+        if (tinted) {
+          const lw = wpx, lh = 30 * scale;
+          _drawEl(tinted, X(x0), Y(_num(vals.get("LightPosition"), 413)) - 15 * scale, lw, lh);
+        }
+      }
+      const isLast = i === keys - 1;
+      const lp = _resolvePath(vals.get(isLast ? "LightingL" : "LightingN"), isLast ? "lightingL" : "lightingN");
+      const lEnt = lp ? _imgEntLoaded(lp) : null;
+      if (lEnt && lEnt.w > 0) {
+        const wOv = _num_list(vals.get(isLast ? "LightingLWidth" : "LightingNWidth"), 0, keys)[i];
+        const wpx2 = wOv > 0 ? wOv * scale : wpx;
+        const hpx2 = Math.max(1, Math.round(lEnt.h * wpx2 / lEnt.w));
+        _drawEnt(lEnt, cx - wpx2 / 2, Y(hitY) - hpx2 / 2, wpx2, hpx2);
+      }
+    }
+  }
+
+  // ═══════════════════════ 音符（下落） ═══════════════════════
+  // LN 先收集（下落 + 按住），循环后统一按 身体→头→尾 绘制（参考 Beatmap_Preview_v）
+  const lnBodies = [], lnHeads = [], lnTails = [];
+  const headHFor = (i) => {
+    const parts = lnParts(i);
+    return (parts.H && parts.H.w > 0) ? Math.max(1, parts.H.h * refW / parts.H.w) : 44;
+  };
+  for (const n of notes) {
+    const { i, isLn, o } = n;
+    const [x0, x1] = cols[i];
+    const wpx = colWpx(i);
+    const drawColor = NOTE_COLORS[i % NOTE_COLORS.length];
+    if (!isLn) {
+      const bottomUnit = hitY - (o.time - t) * v;
+      // 已越过判定线则不再绘制（消失）
+      if (o.time <= t) continue;
+      if (bottomUnit < 0 || bottomUnit > hitY + 20) continue;
+      const e = normalImg(i);
+      if (e && e.w > 0) {
+        const nh = Math.max(1, Math.round(e.h * refW / e.w * scale));
+        const y = upside ? Y(bottomUnit) : Y(bottomUnit) - nh;
+        _drawEnt(e, X(x0), y, wpx, nh, false, flipNotes);
+      } else if (_showDefaultOn()) {
+        const nh = 44 * scale;
+        const yTop = upside ? Y(bottomUnit) : Y(bottomUnit) - nh;
+        ctx.fillStyle = drawColor;
+        ctx.fillRect(X(x0), yTop, wpx, nh);
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(X(x0), Y(bottomUnit) - 1, wpx, Math.max(2, 2 * scale));
+      }
+    } else {
+      // 下落中的 LN（头未到判定线）：记录身体/头/尾
+      const T = o.time, E = o.endTime || 0;
+      if (T > t && E > t) {
+        const headBottom = hitY - (T - t) * v;
+        const tailBottom = hitY - (E - t) * v;
+        const hhu = headHFor(i);
+        lnBodies.push({ i, yTopU: Math.max(0, tailBottom), yBotU: Math.min(hitY, headBottom - hhu / 2) });
+        lnHeads.push({ i, hb: headBottom });
+        if (tailBottom > 0) lnTails.push({ i, y: tailBottom });
+      }
+    }
+  }
+  // 按住中的 LN（头已到判定线、尾未到）：参考项目 lnEnds pass，
+  // 头钉在判定线、身体从判定线中部延伸到尾端
+  for (const ln of hitIndex.lnEnds) {
+    if (ln.t > t) break;
+    if (ln.end <= t) continue; // 只有尾部下落到判定线后整条才消失
+    const o = objs[ln.idx];
+    const i = Math.floor(o.x * keys / 512);
+    if (i < 0 || i >= keys) continue;
+    const tailBottom = hitY - (ln.end - t) * v;
+    const hhu = headHFor(i);
+    lnBodies.push({ i, yTopU: Math.max(0, tailBottom), yBotU: hitY - hhu / 2 });
+    lnHeads.push({ i, hb: hitY });
+    if (tailBottom > 0) lnTails.push({ i, y: tailBottom });
+  }
+  // ── LN 身体 ──
+  for (const b of lnBodies) {
+    const { i, yTopU, yBotU } = b;
+    if (yTopU >= yBotU) continue;
+    const [x0] = cols[i];
+    const wpx = colWpx(i);
+    const parts = lnParts(i);
+    const pixTop = Y(yTopU), pixBot = Y(yBotU);
+    const tpix = Math.min(pixTop, pixBot), bpix = Math.max(pixTop, pixBot);
+    if (parts.L && parts.L.w > 0) {
+      const tileH = Math.max(1, wpx * parts.L.h / parts.L.w);
+      // 从头部端向上平铺到尾部端（像素坐标，兼容 upside）
+      for (let yy = bpix - tileH; yy < tpix + tileH; yy += tileH) {
+        const tp = Math.max(yy, tpix);
+        const bt = Math.min(yy + tileH, bpix);
+        if (bt <= tp) continue;
+        const srcY = (tp - yy) / tileH * parts.L.h;
+        const srcH = (bt - tp) / tileH * parts.L.h;
+        ctx.drawImage(parts.L.img, 0, srcY, parts.L.w, srcH, X(x0), tp, wpx, bt - tp);
+      }
+    } else if (_showDefaultOn()) {
+      // 兜底：同色半透明条
+      ctx.fillStyle = "rgba(150,180,220,0.35)";
+      ctx.fillRect(X(x0), tpix, wpx, bpix - tpix);
+    }
+  }
+  // ── LN 头（钉在判定线或随下落） ──
+  for (const h of lnHeads) {
+    const { i, hb } = h;
+    const [x0] = cols[i];
+    const wpx = colWpx(i);
+    const parts = lnParts(i);
+    const drawColor = NOTE_COLORS[i % NOTE_COLORS.length];
+    if (parts.H && parts.H.w > 0) {
+      const hh = Math.max(1, headHFor(i) * scale);
+      const hy = upside ? Y(hb) : Y(hb) - hh;
+      _drawEnt(parts.H, X(x0), hy, wpx, hh, false, flipNotes);
+    } else if (_showDefaultOn()) {
+      const hh = 44 * scale;
+      const hy = upside ? Y(hb) : Y(hb) - hh;
+      ctx.fillStyle = drawColor;
+      ctx.fillRect(X(x0), hy, wpx, hh);
+    }
+  }
+  // ── LN 尾（尾图或细横线，在尾部端） ──
+  for (const tl of lnTails) {
+    const { i, y } = tl;
+    const [x0] = cols[i];
+    const wpx = colWpx(i);
+    const parts = lnParts(i);
+    const drawColor = NOTE_COLORS[i % NOTE_COLORS.length];
+    if (parts.T && parts.T.w > 0) {
+      const th = Math.max(1, Math.round(parts.T.h * refW / parts.T.w * scale));
+      const ty = Y(Math.max(0, y)) - th / 2;
+      _drawEnt(parts.T, X(x0), ty, wpx, th, false, flipNotes);
+    } else if (_showDefaultOn()) {
+      const th = Math.max(2, 4 * scale);
+      ctx.fillStyle = drawColor;
+      ctx.fillRect(X(x0), Y(Math.max(0, y)) - th / 2, wpx, th);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 主绘制流程（移植自 Python _draw）
 // ---------------------------------------------------------------------------
 
 function _draw(ctx, cw, ch) {
-  const vals = _collectValues();
-  const keys = Math.max(1, Math.min(18, parseInt(_num(vals.get("Keys"), 4), 10) || 4));
+  const page = _pv("page", "游玩界面");
+  const play = !!(_p.play && _p.play.bm) && page === "对局预览";
+  const playKeys = play ? Math.max(1, Math.min(18, _p.play.keys)) : null;
+  const vals = _collectValues(playKeys);
+  const keys = playKeys || Math.max(1, Math.min(18, parseInt(_num(vals.get("Keys"), 4), 10) || 4));
   const layout = NOTE_LAYOUT[keys] || Array(keys).fill("1");
 
   // 画面比例（16:9 / 16:10），据此在画布内拟合一块“屏幕”
@@ -824,6 +1320,9 @@ function _draw(ctx, cw, ch) {
     }
   };
 
+  if (play) {
+    _drawPlayNotes({ ctx, scale, cols, keys, vals, layout, flipKeys, flipNotes, upside, hitY, refW, noteBodyStyle, X, Y });
+  } else {
   if (keysUnder) drawKeys();
 
   // 音符灯光（lightingN/lightingL）：判定线与轨道中心交点处，只画按压列
@@ -956,6 +1455,7 @@ function _draw(ctx, cw, ch) {
   }
 
   if (!keysUnder) drawKeys();
+  } // 结束对局/静态音符分支
 
   // 判定线（mania-stage-hint；分离模式每个舞台各画一条）
   const hintPath = _resolvePath(vals.get("StageHint"), "mania-stage-hint");
@@ -1073,6 +1573,7 @@ function _draw(ctx, cw, ch) {
     ctx.setLineDash([]);
   }
 
+  if (!play) {
   // ---- HUD：血条 / 分数 / 准确度 / 连击计数 / 判定评分 ----
   // 血条为 HUD 级元素，绘制在舞台装饰（StageForeground）之上、贴屏幕底边，
   // 锚定最右轨道右侧、向右上方延伸；倒置时不随舞台翻转。
@@ -1137,6 +1638,7 @@ function _draw(ctx, cw, ch) {
     ctx.restore();
     _pick(hbTag, hbCx - tw / 2, Y(scoreYPos) - th / 2, tw, th);
   }
+  }
 
   // 摘要信息
   const flags = [];
@@ -1149,10 +1651,11 @@ function _draw(ctx, cw, ch) {
     + `| 列宽 ${widths.map((w) => Math.round(w)).join("/")}`
     + (flags.length ? " | " + flags.join(" | ") : "");
 
-  // 页面切换：游玩界面在 HUD 之上绘制“跳过”按钮；暂停界面绘制覆盖层
-  const page = _pv("page", "游玩界面");
-  if (page === "游玩界面") _drawPlaySkip(sx, sy, screenW, screenH, scale);
-  if (page === "暂停界面") _drawPause(sx, sy, screenW, screenH, scale);
+  if (!play) {
+    // 页面切换：游玩界面在 HUD 之上绘制“跳过”按钮；暂停界面绘制覆盖层
+    if (page === "游玩界面") _drawPlaySkip(sx, sy, screenW, screenH, scale);
+    if (page === "暂停界面") _drawPause(sx, sy, screenW, screenH, scale);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1173,8 +1676,8 @@ function _currentKeys() {
  * （与原项目一致：vals 来自编辑器 UI，键数切换即切换所绘制的段）。
  * 注意与 Python 版 sec.get 一致：同一键出现多次时取第一个匹配值，
  * 而非最后覆盖（否则编辑第一个值后预览仍取旧值，表现为"改位置没反应"）。 */
-function _collectValues() {
-  const keys = _currentKeys();
+function _collectValues(keysOverride) {
+  const keys = keysOverride || _currentKeys();
   const sec = findManiaSection(state.ini, keys);
   const v = new Map();
   if (sec) {
@@ -1323,14 +1826,17 @@ function _buildBar() {
     sel.appendChild(o);
   }
   sel.value = _pv("page", "游玩界面");
-  sel.addEventListener("change", () => {
-    state.preview.page = sel.value;
-    _commitPreview();
-    emit("preview:page-changed");
-    _scheduleDraw();
-  });
+  sel.addEventListener("change", () => _onPageChange(sel.value));
   bar.appendChild(sel);
   _p.pageSel = sel;
+
+  // 导入铺面（对局预览）
+  const importBtn = document.createElement("button");
+  importBtn.className = "btn btn-tool preview-btn-sm";
+  importBtn.textContent = "导入铺面";
+  importBtn.title = "选择一张 .osu 谱面（可一并选择其音频）进行动态对局预览";
+  importBtn.addEventListener("click", _importBeatmap);
+  bar.appendChild(importBtn);
 
   // 比例
   const aspectGroup = document.createElement("div");
@@ -1384,7 +1890,63 @@ function _buildBar() {
   });
   bar.appendChild(refreshBtn);
 
+  // 对局预览控制行（首页面选未匹配时隐藏）
+  const playCtl = document.createElement("div");
+  playCtl.className = "preview-play";
+  playCtl.hidden = true;
+  playCtl.innerHTML = `
+    <span class="preview-play-title"></span>
+    <button class="btn btn-tool preview-btn-sm preview-play-btn">▶ 播放</button>
+    <input type="range" class="preview-progress" min="0" max="1" step="1" value="0">
+    <span class="preview-play-time">0:00 / 0:00</span>
+    <label class="preview-speed"><span>下落速度</span>
+      <select class="text-input field-select preview-speed-sel"></select>
+    </label>
+  `;
+  const t = _p.play || _playReset();
+  t.ctl = playCtl;
+  t.titleLbl = playCtl.querySelector(".preview-play-title");
+  t.playBtn = playCtl.querySelector(".preview-play-btn");
+  t.progress = playCtl.querySelector(".preview-progress");
+  t.timeLbl = playCtl.querySelector(".preview-play-time");
+  t.speedSel = playCtl.querySelector(".preview-speed-sel");
+  for (let s = PLAY_SPEED_MIN; s <= PLAY_SPEED_MAX; s++) {
+    const o = document.createElement("option");
+    o.value = String(s);
+    o.textContent = s;
+    t.speedSel.appendChild(o);
+  }
+  t.speedSel.value = String(t.speed);
+  t.playBtn.addEventListener("click", () => _playToggle());
+  t.progress.addEventListener("input", () => { if (t.progress.value !== "") _playSeek(Number(t.progress.value)); });
+  t.speedSel.addEventListener("change", () => _playSetSpeed(t.speedSel.value));
+  bar.appendChild(playCtl);
+
   return bar;
+}
+
+/** 页面切换统一处理：状态、调度、控制行显隐、对局循环启停。 */
+function _onPageChange(page) {
+  state.preview.page = page;
+  _commitPreview();
+  emit("preview:page-changed");
+  const playMode = page === "对局预览";
+  const p = _p.play;
+  // 控制行：只要导入过铺面就显示（进度条/下落速度随时可调），无铺面才隐藏
+  if (p && p.ctl) p.ctl.hidden = !p.bm;
+  if (playMode && p && p.bm) {
+    _schedulePlayLoop();
+  } else if (!playMode) {
+    _stopPlayLoop();
+    if (p) _playPause();
+  }
+  _scheduleDraw();
+}
+
+/** 切到对局预览（导入成功后调用）。 */
+function _playSwitchTo(page) {
+  if (_p.pageSel) _p.pageSel.value = page;
+  _onPageChange(page);
 }
 
 function _syncBar() {
@@ -1394,6 +1956,15 @@ function _syncBar() {
       b.classList.toggle("active", b.dataset.val === state.preview.aspect);
     });
   }
+}
+
+/** 恢复对局预览控制行显隐（画布重渲染后调用）；有铺面才显示。 */
+function _syncPlayCtl() {
+  const p = _p.play;
+  if (!p || !p.ctl) return;
+  p.ctl.hidden = !p.bm;
+  const onPlay = _pv("page", "游玩界面") === "对局预览" && !!p.bm;
+  if (onPlay && !p.raf) _schedulePlayLoop();
 }
 
 function _openShowDialog() {
@@ -1518,6 +2089,7 @@ export function renderPreview() {
   _p.ctx = canvas.getContext("2d");
   _p.aspectSel = bar.querySelector(".preview-aspect");
   _syncBar();
+  _syncPlayCtl();
 
   canvas.addEventListener("click", _onCanvasClick);
   canvas.addEventListener("dblclick", _onCanvasDblClick);

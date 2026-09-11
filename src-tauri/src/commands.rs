@@ -265,6 +265,40 @@ pub fn open_in_explorer(path: String) -> Result<(), String> {
     Ok(())
 }
 
+/// 在目录内（递归）按文件名精确查找文件，返回绝对路径；找不到返回 None。
+/// 用于按 .osu 的 AudioFilename 自动定位谱面同目录的音频文件。
+#[tauri::command]
+pub fn find_file_by_name(folder: String, name: String) -> Option<String> {
+    let root = PathBuf::from(&folder);
+    if !root.is_dir() {
+        return None;
+    }
+    let want = name.trim().to_lowercase();
+    if want.is_empty() {
+        return None;
+    }
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.is_file() {
+                if let Some(f) = path.file_name().and_then(|s| s.to_str()) {
+                    if f.to_lowercase() == want {
+                        return Some(path.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// 用系统默认关联程序打开文件（打开 skin.ini 等）：Windows 下 explorer 即 shell 关联。
 #[tauri::command]
 pub fn open_with_default_app(path: String) -> Result<(), String> {
