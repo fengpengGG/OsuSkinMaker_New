@@ -913,17 +913,10 @@ function _draw(ctx, cw, ch) {
     }
   }
   if (!tailCanvas && headPath) {
-    // 无尾图：用头图垂直翻转
+    // 无尾图：用头图（绘制时翻转形成"倒扣"盖子，见下方 !flipNotes）
     const hEnt = _imgEntLoaded(headPath);
     if (hEnt && hEnt.w > 0) {
-      const tmp = document.createElement("canvas");
-      tmp.width = hEnt.w;   // 1x 逻辑尺寸（canvas 无 naturalWidth）
-      tmp.height = hEnt.h;
-      const g = tmp.getContext("2d");
-      g.translate(0, tmp.height);
-      g.scale(1, -1);
-      g.drawImage(hEnt.img, 0, 0);
-      tailCanvas = tmp;
+      tailCanvas = hEnt.img;
       tailW = lnW;
       tailH = headH;
     }
@@ -945,7 +938,8 @@ function _draw(ctx, cw, ch) {
     if (tailCanvas) {
       const tx = X((lx0 + lx1) / 2) - tailW / 2;
       const ty = Y(lnTop) - tailH / 2;
-      _drawEl(tailCanvas, tx, ty, tailW, tailH, false, flipNotes);
+      // 尾帽"倒扣"在面条顶部：相对头部方向相反（头部 flipV=flipNotes，尾图取反）
+      _drawEl(tailCanvas, tx, ty, tailW, tailH, false, !flipNotes);
       _pick(`${lnPick}T`, tx, ty, tailW, tailH);
     }
   } else if (_showDefaultOn()) {
