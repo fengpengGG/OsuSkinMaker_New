@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "OsuSkinMaker",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "identifier": "com.osuskin.maker",
   "build": {
     "beforeDevCommand": "npm run dev:server",
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "OsuSkinMaker v0.1.0",
+        "title": "OsuSkinMaker v0.1.1",
         "width": 1280,
         "height": 800,
         "minWidth": 860,

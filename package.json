@@ -1,6 +1,6 @@
 {
   "name": "osuskin-maker",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "osu! 皮肤制作工具 (Tauri v2 + 原生 JS)",
   "type": "module",

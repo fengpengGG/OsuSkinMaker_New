@@ -1,4 +1,4 @@
-# OsuSkinMaker v0.1.0 (Tauri)
+# OsuSkinMaker v0.1.1 (Tauri)
 
 一个集 **游玩预览**、**元素管理**、**skin.ini 编辑**于一体的 osu! mania 皮肤制作 GUI 工具。
 
