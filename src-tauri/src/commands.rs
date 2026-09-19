@@ -45,6 +45,47 @@ fn collect_images(dir: &Path, out: &mut Vec<String>) {
     }
 }
 
+/// 在文件夹内（递归、忽略大小写）按文件名查找单个文件，返回绝对路径。
+/// 用于定位谱面目录中的音频（AudioFilename）与背景图（[Events] 背景）。
+#[tauri::command]
+pub fn find_file_by_name(folder: String, name: String) -> Option<String> {
+    let root = PathBuf::from(&folder);
+    // 谱面里的 AudioFilename 可能带子目录（如 "audio/song.mp3"），只取文件名部分比对
+    let base = name
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    if !root.is_dir() || base.is_empty() {
+        return None;
+    }
+    find_by_name(&root, &base)
+}
+
+fn find_by_name(dir: &Path, target: &str) -> Option<String> {
+    let entries = fs::read_dir(dir).ok()?;
+    let mut subdirs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            subdirs.push(path);
+            continue;
+        }
+        if let Some(n) = path.file_name().and_then(|s| s.to_str()) {
+            if n.to_lowercase() == target {
+                return Some(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    for d in subdirs {
+        if let Some(found) = find_by_name(&d, target) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // 编码检测与读写
 // ---------------------------------------------------------------------------
@@ -263,40 +304,6 @@ pub fn open_in_explorer(path: String) -> Result<(), String> {
     }
     cmd.spawn().map_err(|e| e.to_string())?;
     Ok(())
-}
-
-/// 在目录内（递归）按文件名精确查找文件，返回绝对路径；找不到返回 None。
-/// 用于按 .osu 的 AudioFilename 自动定位谱面同目录的音频文件。
-#[tauri::command]
-pub fn find_file_by_name(folder: String, name: String) -> Option<String> {
-    let root = PathBuf::from(&folder);
-    if !root.is_dir() {
-        return None;
-    }
-    let want = name.trim().to_lowercase();
-    if want.is_empty() {
-        return None;
-    }
-    let mut stack = vec![root];
-    while let Some(dir) = stack.pop() {
-        let entries = match fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.is_file() {
-                if let Some(f) = path.file_name().and_then(|s| s.to_str()) {
-                    if f.to_lowercase() == want {
-                        return Some(path.to_string_lossy().into_owned());
-                    }
-                }
-            }
-        }
-    }
-    None
 }
 
 /// 用系统默认关联程序打开文件（打开 skin.ini 等）：Windows 下 explorer 即 shell 关联。

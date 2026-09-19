@@ -10,7 +10,7 @@ import { openSettings, toast, promptText, confirmDialog, makeSplitter } from "./
 // 元素管理 / skin.ini 编辑 / 游玩预览 各自的渲染模块
 import { renderPanel, refreshPanel } from "./panel.js";
 import { renderIniTab, refreshIni, saveAllToIni, syncOriginals } from "./ini_tab.js";
-import { renderPreview, refreshPreview, mountPreviewActions } from "./preview.js";
+import { renderPreview, refreshPreview, mountPreviewActions, exitPlayFullscreen } from "./preview.js";
 
 // ---------------------------------------------------------------------------
 // 主题
@@ -192,6 +192,7 @@ async function init() {
     _closing = true;
     event.preventDefault();
     try {
+      await exitPlayFullscreen(); // 先退出全屏播放，避免全屏尺寸被写进窗口状态
       await persistSettings();
     } catch (e) {
       console.warn("关闭前保存设置失败", e);

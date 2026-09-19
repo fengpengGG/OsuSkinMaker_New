@@ -14,6 +14,7 @@ pub fn run() {
         // 保持后端注册与前端调用一一对应（如 path_exists）。
         .invoke_handler(tauri::generate_handler![
         commands::list_images,
+            commands::find_file_by_name,
             commands::read_text,
             commands::read_file_bytes,
             commands::write_text_atomic,
@@ -22,7 +23,6 @@ pub fn run() {
             commands::delete_file,
             commands::create_folder,
             commands::open_in_explorer,
-            commands::find_file_by_name,
             commands::open_with_default_app,
             commands::pick_folder,
             commands::pick_files,

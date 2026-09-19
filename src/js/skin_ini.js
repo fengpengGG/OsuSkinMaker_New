@@ -236,7 +236,7 @@ export const MANIA_COMMANDS = [
   new Command("UpsideDown", "bool", "始终倒置", "0"),
   new Command("KeyFlipWhenUpsideDown", "bool", "倒置时翻转按键", "1"),
   new Command("NoteFlipWhenUpsideDown", "bool", "倒置时翻转音符", "1"),
-  new Command("NoteBodyStyle", "choice", "长条身体样式", "1", ["0=拉伸", "1=从顶", "2=从底"]),
+  new Command("NoteBodyStyle", "choice", "长条身体样式", "1", ["0=拉伸", "1=从面尾平铺", "2=从面头平铺", "3=从面头平铺(贴图顶端)", "4=两端平铺"], "osu!stable / wiki 语义（Version ≥ 2.5 起生效）：0=Stretch 整张贴图拉伸；1=Cascade from top 从面尾（远端）开始依次平铺（默认）；2=Cascade from bottom 从面头（判定线侧）开始依次平铺；3=RepeatBottom、4=RepeatTopAndBottom 为 stable 枚举中的扩展值（wiki 未描述），预览分别按「从面头平铺、贴图顶端对齐面头」与「面尾/面头两端同时平铺」处理"),
   new Command("WidthForNoteHeightScale", "number", "音符高度缩放基准宽", "", [], "列宽不同时以最窄列为准"),
   new Command("StageLeft", "image", "左舞台贴图", "", [], "mania-stage-left.png"),
   new Command("StageRight", "image", "右舞台贴图", "", [], "mania-stage-right.png"),

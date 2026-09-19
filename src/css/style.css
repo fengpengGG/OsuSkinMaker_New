@@ -330,20 +330,42 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .preview-aspect { display: inline-flex; gap: 2px; align-items: center; font-size: 12px; color: var(--text-secondary); }
 .preview-aspect .btn.active { background: var(--accent-gradient); color: #fff; }
 .preview-btn-sm { padding: 4px 10px; font-size: 12px; }
-/* 对局预览控制行 */
-.preview-play {
-  display: flex; align-items: center; gap: 8px; flex: 1 1 100%;
-  padding: 6px 10px; border-top: 1px solid var(--border);
-  flex-wrap: nowrap; min-width: 0;
+/* 动态预览控制行：整行独占，歌曲名 / 播放 / 进度条 / 下落速度同处一行 */
+.preview-play { display: flex; align-items: center; gap: 8px; flex: 1 1 100%; min-width: 0; }
+/* JS 用 .hidden = true 控制显隐，需显式覆盖上面的 display:flex（author 样式优先于 UA 的 [hidden]） */
+.preview-play[hidden] { display: none; }
+/* 设置 play_bar_pos = bottom：控制行作为画布下方的独立一行（不参与纵向拉伸） */
+.preview-host > .preview-play { flex: 0 0 auto; padding: 8px 10px; border-top: 1px solid var(--border); }
+.preview-play-title {
+  flex: 0 1 auto; min-width: 0; max-width: 42%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text-secondary);
 }
-.preview-play-title { flex: 1 1 60%; min-width: 0; font-size: 12px; color: var(--text-primary);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.preview-progress { flex: 3 1 120px; accent-color: #7c6cff; cursor: pointer; }
-.preview-play-time { font-size: 12px; color: var(--text-secondary); white-space: nowrap; }
-.preview-speed { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--text-secondary); }
-.preview-speed .field-select { max-width: 68px; padding: 2px 6px; }
+.preview-play-btn { flex: 0 0 auto; }
+.preview-progress { flex: 1 1 120px; min-width: 60px; margin: 0; }
+.preview-play-time { flex: 0 0 auto; font-size: 12px; color: var(--text-secondary); }
+.preview-speed {
+  display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto;
+  font-size: 12px; color: var(--text-secondary); white-space: nowrap;
+}
+.preview-speed-sel { width: 96px; margin: 0; }
+.preview-speed-val { min-width: 16px; text-align: center; color: var(--text-primary); }
 .preview-canvas-wrap { flex: 1; position: relative; background: var(--canvas); overflow: hidden; }
 .preview-canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+
+/* ============================ 全屏播放（F11 / 控制行按钮） ============================ */
+/* 隐藏工具栏与右侧面板，预览区铺满窗口（窗口本身由 setFullscreen 进入原生全屏） */
+body.play-fullscreen #toolbar { display: none; }
+body.play-fullscreen #main { height: 100%; padding: 0; gap: 0; overflow: hidden; }
+body.play-fullscreen #side-pane { display: none; }
+body.play-fullscreen #main > .splitter { display: none; }
+/* 分割条会给 #preview-pane 写 inline flex/width，需 !important 覆盖才能铺满 */
+body.play-fullscreen #preview-pane { flex: 1 1 auto !important; width: auto !important; }
+body.play-fullscreen .preview-host { border: 0; border-radius: 0; backdrop-filter: none; }
+/* 工具栏内仅保留播放控制行（play_bar_pos = top 时控制行在工具栏里） */
+body.play-fullscreen .preview-bar { padding: 0; border-bottom: 0; }
+body.play-fullscreen .preview-bar > :not(.preview-play) { display: none; }
+body.play-fullscreen .preview-play { padding: 6px 10px; }
 .preview-info {
   padding: 5px 10px; font-size: 12px; color: var(--text-secondary);
   min-height: 20px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -420,6 +442,11 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 /* UI 大小缩放：滑条弹性 + 数值输入框固定宽 */
 .ui-scale-row { align-items: center; gap: 12px; }
 .ui-scale-row input[type="range"] { flex: 1; min-width: 120px; }
+/* 动态预览判定权重：名称 + 滑条 + 数值框同排 */
+.judge-row { align-items: center; gap: 10px; flex-wrap: nowrap; }
+.judge-row .judge-name { flex: 0 0 116px; font-size: 13px; color: var(--text-secondary); }
+.judge-row input[type="range"] { flex: 1 1 auto; min-width: 90px; }
+.judge-row .judge-num { flex: 0 0 auto; width: 72px; }
 .opt { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; font-size: 13px; padding: 3px 0; }
 .opt.checkbox { display: block; margin: 6px 0; }
 .opt input { accent-color: var(--accent); cursor: pointer; }

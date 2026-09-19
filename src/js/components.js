@@ -1,6 +1,6 @@
 // 可复用 UI 组件：模态框、确认框、文本输入框、设置弹窗。
 
-import { state, persistSettings, emit } from "./state.js";
+import { state, persistSettings, emit, JUDGE_KEYS } from "./state.js";
 
 // -- 可拖拽分隔条 ----------------------------------------------------------
 
@@ -382,6 +382,50 @@ export function openSettings() {
       state.settings.enable_category = v; await markChange();
     }),
   ]));
+
+  // 动态预览控制栏位置
+  scroll.appendChild(card("动态预览", "控制栏（歌曲名 / 播放 / 进度条 / 下落速度）的放置位置", [
+    radioGroup("play_bar_pos",
+      [["top", "游玩预览上面"], ["bottom", "游玩预览下面"]],
+      s.play_bar_pos,
+      async (v) => { state.settings.play_bar_pos = v; await markChange(); }),
+  ]));
+
+  // 动态预览判定权重（模拟「手打」的判定分布，可自行调整）
+  const JUDGE_LABEL = {
+    "300g": "300g（Perfect）", "300": "300（Great）", "200": "200（Good）",
+    "100": "100（Ok）", "50": "50（Meh）", miss: "miss（Miss）",
+  };
+  const judgeRows = JUDGE_KEYS.map((key) => {
+    const row = document.createElement("div");
+    row.className = "opt-row judge-row";
+    const name = document.createElement("span");
+    name.className = "judge-name";
+    name.textContent = JUDGE_LABEL[key] || key;
+    const range = document.createElement("input");
+    range.type = "range";
+    range.min = "0"; range.max = "1000"; range.step = "10";
+    range.value = String(s.judge_weights[key]);
+    const num = document.createElement("input");
+    num.type = "number";
+    num.className = "text-input inline judge-num";
+    num.min = "0"; num.max = "1000"; num.step = "10";
+    num.value = String(s.judge_weights[key]);
+    // 滑条与数值框互为回显：拖动/输入后统一写入 settings（提交时才持久化）
+    const apply = (raw) => {
+      const n0 = Number(raw);
+      const n = Math.min(1000, Math.max(0, Number.isFinite(n0) ? Math.round(n0) : 0));
+      range.value = String(n);
+      num.value = String(n);
+      state.settings.judge_weights[key] = n;
+    };
+    range.addEventListener("input", () => apply(range.value));
+    range.addEventListener("change", async () => { apply(range.value); await markChange(); });
+    num.addEventListener("change", async () => { apply(num.value); await markChange(); });
+    row.append(name, range, num);
+    return row;
+  });
+  scroll.appendChild(card("动态预览判定", "动态预览没有真实输入，按此权重随机模拟判定（同一谱面结果固定、可复现）。权重为相对值，总和不必为 1000 —— 内部按总和归一；全设 0 视为全 Perfect。", judgeRows));
 
   // UI 大小（界面整体缩放）
   const scaleRow = document.createElement("div");

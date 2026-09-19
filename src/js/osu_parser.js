@@ -8,7 +8,8 @@ const LN_BIT = 128;
 /**
  * 解析 .osu 谱面文本。
  * @param {string} content .osu 全文
- * @returns {object} { mode, circleSize, previewTime, title, artist, creator, version,
+ * @returns {object} { mode, circleSize, previewTime, audioFilename, backgroundFilename,
+ *                     title, artist, creator, version,
  *                     bpm, timingPoints, hitObjects, noteCount, lnCount, durationMs,
  *                     beatSects, hitIndex }
  */
@@ -44,6 +45,15 @@ export function parseOsuBeatmap(content) {
     if (line.slice(0, i).trim() === "CircleSize") {
       cs = Math.round(parseFloat(line.slice(i + 1).trim())) || 4;
     }
+  });
+
+  // Events
+  // 背景/视频行形如：0,0,"bg.jpg",0,0  /  1,0,"bg.jpg"  /  Video,0,"v.avi"
+  let backgroundFilename = "";
+  (sections["Events"] || []).forEach((line) => {
+    if (backgroundFilename) return;
+    const m = line.match(/^(?:0|1|Video)\s*,\s*-?\d+\s*,\s*"([^"]+)"/i);
+    if (m) backgroundFilename = m[1];
   });
 
   // Metadata
@@ -92,14 +102,53 @@ export function parseOsuBeatmap(content) {
   const bpm = utp ? 60000 / utp.beatLength : 0;
 
   return {
-    mode, circleSize: cs, previewTime, audioFilename,
+    mode, circleSize: cs, previewTime, audioFilename, backgroundFilename,
     title: meta.Title || meta.TitleUnicode || "未命名",
     artist: meta.Artist || meta.ArtistUnicode || "未知",
     creator: meta.Creator || "", version: meta.Version || "",
     bpm, timingPoints, hitObjects, noteCount, lnCount, durationMs,
     beatSects: buildBeatSections(timingPoints, durationMs),
+    barLines: buildBarLines(timingPoints, hitObjects, lastObj),
     hitIndex: buildHitIndex(hitObjects),
   };
+}
+
+/**
+ * 生成小节线，对齐官方 BarLineGenerator<TBarLine>：
+ * 只有非继承 timing point 参与；小节长 = beatLength × meter；
+ * 起点 = timingPoint.Time（若早于 Math.Min(0, 首个物件时间) 则按小节对齐后取整）；
+ * 终点 = 下一个非继承 timing point 时间，最后一段 = 1 + 最后物件时间 + 一小节；
+ * Major = 小节内的拍序 % meter === 0。
+ * @param {Array} timingPoints 解析结果（含 {time, beatLength, meter, inherited}）
+ * @param {Array} hitObjects 已按时间升序排序的物件
+ * @param {number} lastObjectTime 最后物件的结束时间
+ * @returns {Array<{t:number, major:boolean}>}
+ */
+export function buildBarLines(timingPoints, hitObjects, lastObjectTime) {
+  const out = [];
+  const utps = timingPoints.filter((tp) => !tp.inherited && tp.beatLength > 0);
+  if (!utps.length || !hitObjects.length) return out;
+  const EPS = 1e-3; // 官方 Precision.DOUBLE_EPSILON
+  const generationStartTime = Math.min(0, hitObjects[0].time);
+  const lastHitTime = 1 + lastObjectTime;
+  for (let i = 0; i < utps.length; i++) {
+    const tp = utps[i];
+    const numerator = tp.meter > 0 ? tp.meter : 4;
+    const barLength = tp.beatLength * numerator;
+    const endTime = i < utps.length - 1 ? utps[i + 1].time : lastHitTime + barLength;
+    const startTime = tp.time > generationStartTime
+      ? tp.time
+      : tp.time + Math.ceil((generationStartTime - tp.time) / barLength) * barLength;
+
+    let beat = 0;
+    for (let t = startTime; t <= endTime + EPS; t += barLength, beat++) {
+      // 浮点误差导致 t 略小于整数时对齐取整（官方 AlmostEquals 处理）
+      const rounded = Math.round(t);
+      if (Math.abs(t - rounded) < EPS) t = rounded;
+      out.push({ t, major: beat % numerator === 0 });
+    }
+  }
+  return out;
 }
 
 /** 无继承 timing point -> [[起, 拍长, 止], ...]，画节拍网格用。 */

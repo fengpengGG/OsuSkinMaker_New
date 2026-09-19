@@ -1,6 +1,6 @@
-# OsuSkinMaker v0.1.0 (Tauri)
+# OsuSkinMaker v0.1.5 beta (Tauri)
 
-一个集 **游玩预览**、**元素管理**、**skin.ini 编辑**于一体的 osu! mania 皮肤制作 GUI 工具。
+一个集 **游玩预览**、**动态预览（对局预览）**、**元素管理**、**skin.ini 编辑**于一体的 osu! mania 皮肤制作 GUI 工具。
 
 ⚠️ **使用的话要备份皮肤文件，备份，备份，备份！！！**
 
@@ -24,6 +24,8 @@
 - [记忆功能](#记忆功能)
 - [素材文件编码与保存安全](#素材文件编码与保存安全)
 - [左侧：游玩预览](#左侧游玩预览)
+- [左侧：动态预览（导入铺面）](#左侧动态预览导入铺面)
+- [全屏播放](#全屏播放)
 - [右侧：元素管理](#右侧元素管理)
 - [右侧：skin.ini 编辑](#右侧skinini-编辑)
 - [注意事项（相对于原版的变化）](#注意事项相对于原版的变化)
@@ -117,6 +119,9 @@ powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
   - 打开设置弹窗（含浅色/深色主题切换）
 - **路径卡片**
   - 显示当前皮肤文件夹路径（悬浮可看完整路径）
+- **动态预览控制行**（可选位置）
+  - 在「动态预览」页且已导入谱面时出现：歌曲名 / 播放暂停 / 进度条 / 时间 / 下落速度 / 全屏
+  - 默认放在工具栏内，可在设置里改为放在画布下方（见 [设置弹窗](#设置弹窗)）
 
 ## 设置弹窗
 
@@ -141,6 +146,12 @@ powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
 - **元素管理按当前预览界面分类显示**
   - 开启时：只显示当前预览界面（游玩/暂停/失败/结算/选歌）对应的元素
   - 关闭时：显示全部元素（保持树状分组），任意界面都可见
+- **动态预览：控制栏位置**
+  - 控制栏（歌曲名 / 播放 / 进度条 / 下落速度）放在 **游玩预览上面**（工具栏内）或 **下面**（画布下方）
+- **动态预览判定：权重**
+  - 动态预览没有真实输入，按此权重随机模拟判定（300g / 300 / 200 / 100 / 50 / miss）
+  - 同一谱面结果固定、可复现；权重为相对值，总和不必为 1000（内部按总和归一），全设 0 视为全 Perfect
+  - 默认以 300g 为主 + 少量 miss，便于演示断连效果
 - **UI 大小**
   - 整体界面缩放滑条（0.7 ~ 1.5），实时预览
   - 弹窗与 toast 会反向抵消，任意大小下都完整留在视口内可操作
@@ -164,6 +175,9 @@ powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
 - **预览状态**
   - 最后一次的界面、显示开关（背景图/连击图/警告箭头/跳过按钮）
   - 画幅比例、自定义分数/acc/连击/中间评分
+- **动态预览状态**
+  - 下落速度（1\~40）
+  - 上次导入的谱面（.osu 路径），启动后自动重新载入
 
 > 窗口状态由 **Rust 侧（window\_state.rs，tao window API）** 保存/恢复，前端不处理窗口状态。
 
@@ -186,7 +200,7 @@ powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
 ### 控制栏
 
 - **界面**
-  - 下拉选择预览的界面：游玩 / 暂停 / 失败 / 成绩结算 / 选歌
+  - 下拉选择预览的界面：游玩 / **动态预览** / 暂停 / 失败 / 成绩结算 / 选歌
 - **比例**
   - 16:9 / 16:10 切换
 - **显示**
@@ -194,6 +208,8 @@ powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
 - **数值**
   - 自定义分数、准确度、连击数
   - 中间评分下拉：300g / 300 / 200 / 100 / 50 / miss
+- **导入铺面**
+  - 选择一张 `.osu` 谱面，切到「动态预览」页按谱面实时下落播放（详见下一节）
 - **刷新**
   - 手动刷新预览（重新读取素材清单与 skin.ini）
 
@@ -209,6 +225,12 @@ powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
 
 修改右侧 skin.ini 编辑器的任何字段，预览会**实时刷新**。
 
+### 图层顺序（对齐官方 mania）
+
+由底到顶：**列背景（含舞台灯光）→ 接收器（KeysUnderNotes=1 时在此）→ 命中检测器 / 判定线 → 音符 → 接收器（默认）→ 打击爆炸 / 判定图 → 舞台前景 → HUD**。
+
+> 官方 `KeysUnderNotes` 默认 0（按键在音符**之上**）；置 1 时按键被移入音符**之下**。
+
 ### 点击选中预览组件
 
 - 开启"点击选中游玩预览组件"后：
@@ -216,6 +238,38 @@ powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
   - **双击**：逐层向下、循环回顶层
   - 高亮虚线框指示当前选中的那一层
 - 暂停界面下点击，联动界面保持不动
+
+## 左侧：动态预览（导入铺面）
+
+在控制栏点 **导入铺面** 选一张 `.osu` 后自动切到「动态预览」页，按谱面时间实时下落播放，用来核对皮肤在实际对局中的观感。
+
+- **谱面解析**
+  - 新增 `src/js/osu_parser.js`：解析 `HitObjects`、键数（`CircleSize`）、时长、`PreviewTime`、BPM、小节线、音频文件名
+  - 音频按 `.osu` 的 `AudioFilename` 在后端递归查找（`find_file_by_name`）自动匹配；找不到才退化为手动多选音频
+- **控制行**（仅动态预览页且已导入谱面时显示）
+  - 歌曲名 / 播放暂停 / 进度条（可拖动 seek）/ 时间 / 下落速度（1\~40）/ 全屏
+  - 位置可在设置中选「游玩预览上面 / 下面」
+- **下落速度**
+  - 只影响音符可见窗口（`visibleMs = 11485 / speed`），**不影响**音乐与时钟速度
+  - 数值随设置持久化
+- **渲染**
+  - 基键常显，按下时叠加 `KeyImageD`；LN 按住期间保持按下，尾过线后按官方 80ms 延迟切回抬起图
+  - 舞台灯光按 `LightFramePerSecond` 播放 `mania-stage-light` 动画帧；按下瞬间点亮，松开后 250ms 淡出并纵向压扁
+  - 长条两阶段：下落时头部随下落、身体从尾部铺到头部；头到判定线后按住（头钉判定线、身体延伸到尾部）
+  - 命中检测器（`mania-stage-hint` + 判定线）按官方层级绘制在音符**之下**，上下镜像（`UpsideDown`）时与音符、按键、灯光一起翻转
+- **判定与成绩**
+  - 判定图 + 打击爆炸 + 连击 + 分数 + 准确率，公式取自官方 `ManiaScoreProcessor`
+  - 判定结果按设置里的权重模拟（可复现），断连时按官方连击计数器用 `ColourBreak` 色做 pop-out
+- **状态保持**
+  - 对局态存在 `_p.play`，改 skin.ini / 重扫素材 / 切页面都不会丢弃已导入的谱面；离开动态预览页自动暂停
+
+## 全屏播放
+
+- 快捷键 **F11**，或控制行右侧的 **⛶ 全屏** 按钮
+- 窗口原生全屏 + 隐藏工具栏与右侧面板，预览铺满，便于看实际观感
+- 仅在「动态预览」页且已导入谱面时可用（保证随时有退出入口）；退出：再按 F11 或点「⛶ 退出全屏」
+- 浏览器调试环境下退化为 DOM 全屏
+- 退出全屏播放时会先退出全屏，避免把全屏尺寸写进窗口状态
 
 ## 右侧：元素管理
 
@@ -300,6 +354,9 @@ powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
 - **存在状态三态**：**存在**（根目录）/ **存在(skin.ini)**（仅由 skin.ini 指定）/ **缺失**
 - **动画**：多帧动画默认显示第一帧
 - **长条样式**：0=拉伸 / 1=从顶 / 2=从底
+- **倒置（UpsideDown）**：整个游戏画面上下镜像，音符自下往上落、接收器在顶部；列底、灯光、按键、音符、长条与判定线一并翻转
+- **分离舞台（SplitStages）**：`SeparateScore` 官方默认为 **1**，判定图显示在命中所属舞台的中心
+- **动态预览**：判定结果为**按权重模拟**，不是真实手感；下落速度只改变音符可见窗口，不改变音乐速度
 - **免责声明**：预览里的坐标、尺寸、图层顺序尽量贴近官方规范，但**预览 ≠ 实机**
 
 ***
@@ -328,6 +385,7 @@ e:\trae\osuskin_s\
 │       ├── preview.js       游玩预览渲染（坐标变换、HUD、图层、点击选中）
 │       ├── ini_tab.js       skin.ini 编辑页（表单引擎、色板、滑条、重置/重扫、素材浏览）
 │       ├── panel.js         元素管理面板（树、筛选、预览缩放、增删替换、动画）
+│       ├── osu_parser.js    .osu 谱面解析（HitObjects / 键数 / BPM / 小节线 / 音频名 / 二分索引）
 │       └── utilities.js     通用纯函数（颜色/数值解析等）
 └── src-tauri/               Rust 后端
     ├── Cargo.toml           依赖：tauri v2、dialog 插件、image（PNG/TIFF 转码）
@@ -351,9 +409,9 @@ src/js/app.js ──► state.js   components.js   panel.js   ini_tab.js   previ
                    └──────────────────────────────────────────────────────┘
                               │  invoke
                               ▼
-src-tauri/src/commands.rs（list_images / read_text / write_text_atomic / copy_file /
-                        delete_file / create_folder / open_in_explorer / open_with_default_app /
-                        pick_folder / pick_files / read_file_bytes / path_exists / load_settings / save_settings）
+src-tauri/src/commands.rs（list_images / find_file_by_name / read_text / read_file_bytes / write_text_atomic /
+                        copy_file / delete_file / create_folder / open_in_explorer / open_with_default_app /
+                        pick_folder / pick_files / path_exists / load_settings / save_settings）
 ```
 
 - `api.js` 是前后端唯一边界：所有 `invoke` 走这里
@@ -369,7 +427,8 @@ src-tauri/src/commands.rs（list_images / read_text / write_text_atomic / copy_f
 | `skin_ini.js` | `SkinIni.parse/serialize`、`Entry/Section/SkinIni` 数据模型、命令 schema（General/Colours/Fonts/Mania 各段命令列表） |
 | `catalog.js` | 元素目录：模式分组 → 功能分类，元素的中文名、建议尺寸、混合模式、界面归属；数字前缀默认值 |
 | `manager.js` | `SkinManager` 索引图片（根目录 + skin.ini 指定），`hasBase/status/pathForStem` 做存在判定与 @2x 优先 |
-| `preview.js` | 游玩/暂停/失败界面渲染：坐标 `X()/Y()`、图层顺序、HUD、血条、点击选中、倒置 |
+| `preview.js` | 游玩/暂停/失败界面渲染：坐标 `X()/Y()`、图层顺序、HUD、血条、点击选中、倒置；动态预览（按谱面时间下落、LN 两阶段、判定/成绩模拟、全屏播放） |
+| `osu_parser.js` | `.osu` 谱面解析：`HitObjects`（含 LN）、键数、时长、`PreviewTime`、BPM、小节线、音频名、二分索引 |
 | `ini_tab.js` | 表单引擎：按 schema 渲染字段（文本/图片浏览/数值滑块/rgb(a)色板+alpha滑条/下拉）；重置、重置所有、重新扫描；素材浏览复制 |
 | `panel.js` | 元素树（分组展示、三态徽章）、筛选、预览缩放平移、增删替换、多帧动画播放 |
 | `components.js` | toast、confirm/prompt 对话框、可拖分割条、取色器等复用件 |
@@ -382,6 +441,7 @@ src-tauri/src/commands.rs（list_images / read_text / write_text_atomic / copy_f
 | 命令 | 说明 |
 | --------------------------------------------- | ---------------------------- |
 | `list_images` | 列出皮肤目录图片，建立索引 |
+| `find_file_by_name` | 在指定目录下递归按文件名查找（动态预览自动匹配谱面音频） |
 | `read_text` | 按编码读取文本（含编码检测） |
 | `read_file_bytes` | 读取文件原始字节（大图/素材用 Blob） |
 | `write_text_atomic` | 原子写入文本（临时文件 + 替换） |
@@ -445,4 +505,6 @@ src-tauri/src/commands.rs（list_images / read_text / write_text_atomic / copy_f
 - 仍是「一个很糙的 AI 生成的小玩意」，优化可能不是很好，还有一堆神秘 bug
 - 只做了 mania 相关的 skin.ini 编辑与游玩预览；对其他模式不太了解
 - 选歌界面/成绩结算预览的摆放较难，尚未完善
+- 动态预览（导入铺面实时下落）为 v0.1.5 beta 新增，判定是模拟出来的，只用于看皮肤观感
+- 只做了 stable 表现；lazer 模式切换尚未实现
 - 如发现问题或有什么建议，欢迎提出，非常感谢

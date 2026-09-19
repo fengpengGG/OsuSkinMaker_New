@@ -27,7 +27,12 @@ const VALID = {
   theme: ["light", "dark"],
   hd_default: ["hd", "normal", "ask"],
   ini_import_mode: ["path", "copy"],
+  // 动态预览控制行位置：画布上方（工具栏内）/ 画布下方
+  play_bar_pos: ["top", "bottom"],
 };
+
+// 动态预览判定结果顺序（权重表按此顺序取值；与官方 mania 判定档位一致）
+export const JUDGE_KEYS = ["300g", "300", "200", "100", "50", "miss"];
 
 const DEFAULT_SETTINGS = {
   theme: "dark",
@@ -42,6 +47,13 @@ const DEFAULT_SETTINGS = {
   // 预览选中图层高亮框：是否显示 + 颜色（rgba 字符串）
   hitbox_show: true,
   hitbox_color: "rgba(64, 200, 255, 0.9)",
+  // 动态预览控制行（歌曲名 / 播放 / 进度条 / 下落速度）位置："top" 画布上方（默认）| "bottom" 画布下方
+  play_bar_pos: "top",
+  // 动态预览判定权重（相对值，内部按总和归一）：默认 300g 为主 + 少量 miss 以演示断连
+  judge_weights: { "300g": 640, "300": 220, "200": 70, "100": 40, "50": 20, miss: 10 },
+  // 动态预览下落速度（官方 ScrollSpeed 1~40，越大越快）与上次载入的谱面（.osu 路径，启动自动恢复）
+  play_speed: 25,
+  last_beatmap: "",
   // 窗口状态（与原项目字段一致）：无记录时默认最大化
   window_state: "zoomed",  // "zoomed" | "normal"
   window_geometry: null,   // { width, height, x, y } 物理像素
@@ -58,6 +70,7 @@ export const state = {
   manager: null, // SkinManager
   ini: new SkinIni(), // 当前 skin.ini（编辑中的内存对象）
   iniEncoding: "utf-8-sig",
+  iniRawText: null, // 最近一次从磁盘读到的 skin.ini 原文（用于判断磁盘是否被外部改动）
   dirty: false,
 
   // 预览状态（持久化，与 Python 版 preview_* 字段对应）
@@ -88,7 +101,7 @@ function _sanitize(settings) {
   }
   const _scale = Number(out.ui_scale);
   out.ui_scale = Number.isFinite(_scale) ? Math.min(1.5, Math.max(0.7, _scale)) : 1;
-  for (const key of ["hd_default", "ini_import_mode", "theme"]) {
+  for (const key of ["hd_default", "ini_import_mode", "theme", "play_bar_pos"]) {
     const list = VALID[key];
     if (list && !list.includes(out[key])) out[key] = { ...DEFAULT_SETTINGS }[key];
   }
@@ -98,6 +111,18 @@ function _sanitize(settings) {
   if (typeof out.hitbox_color !== "string" || !out.hitbox_color) {
     out.hitbox_color = DEFAULT_SETTINGS.hitbox_color;
   }
+  // 判定权重：只保留 JUDGE_KEYS 的合法非负数，缺项/非法值回落默认
+  const _jw = out.judge_weights;
+  const _jwOut = {};
+  for (const k of JUDGE_KEYS) {
+    const v = _jw && typeof _jw === "object" ? Number(_jw[k]) : NaN;
+    _jwOut[k] = Number.isFinite(v) && v >= 0 ? Math.min(100000, v) : DEFAULT_SETTINGS.judge_weights[k];
+  }
+  out.judge_weights = _jwOut;
+  // 下落速度（1~40 取整）与上次谱面路径
+  const _sp = Number(out.play_speed);
+  out.play_speed = Number.isFinite(_sp) ? Math.min(40, Math.max(1, Math.round(_sp))) : DEFAULT_SETTINGS.play_speed;
+  if (typeof out.last_beatmap !== "string") out.last_beatmap = DEFAULT_SETTINGS.last_beatmap;
   if (typeof out.preview !== "object" || !out.preview) out.preview = { ...state.preview };
   else out.preview = { ...state.preview, ...out.preview };
   if (typeof out.expanded !== "object" || !out.expanded) out.expanded = {};
@@ -180,6 +205,7 @@ export async function loadIni() {
     text = null;
   }
   state.iniEncoding = encoding;
+  state.iniRawText = text;
   state.ini = text != null ? SkinIni.parse(text) : new SkinIni();
   state.dirty = false;
 }
@@ -197,10 +223,23 @@ async function scanImages() {
 }
 
 /** 重新扫描皮肤文件夹（识别外部新增/删除/覆盖的素材），并通知各模块刷新。
- * 与打开皮肤不同：不重读 skin.ini，仅更新图片清单与素材存在状态。 */
+ * 与打开皮肤不同：不重读内存中未保存的编辑；但若磁盘上的 skin.ini 已被外部改动
+ * （且当前没有未保存编辑），一并重新解析，避免"改了 skin.ini 预览不跟随"。 */
 export async function rescanSkin() {
   if (!state.skinFolder || !state.manager) return false;
   try {
+    if (!state.dirty) {
+      let text = null;
+      try {
+        text = (await invoke("read_text", { path: folderIniPath() })).text;
+      } catch (e) {
+        text = null; // 无 skin.ini（或读取失败）时按空白处理
+      }
+      if ((text ?? "") !== (state.iniRawText ?? "")) {
+        state.iniRawText = text;
+        state.ini = text != null ? SkinIni.parse(text) : new SkinIni();
+      }
+    }
     const paths = await invoke("list_images", { folder: state.skinFolder });
     state.images = paths;
     state.manager.scan(paths);
@@ -225,6 +264,7 @@ export async function saveIni() {
   // 无 BOM 的 UTF-8 / latin-1 升级为带 BOM（与 Python 版一致，后端也做了兜底）
   const enc = state.iniEncoding;
   await invoke("write_text_atomic", { path: folderIniPath(), text, encoding: enc });
+  state.iniRawText = text; // 记录磁盘原文，避免下次重扫时误判为外部改动
   state.dirty = false;
   emit("skin:saved");
 }

@@ -4,8 +4,8 @@
 // 面板以 ColumnStart 从左侧绝对定位，因此 mania 演奏面板整体偏左。
 // 皮肤图片经后端 base64（loadImageSrc）加载，@2x 按官方规则减半为 1x 逻辑尺寸。
 
-import { state, on, emit, persistSettings, rescanSkin } from "./state.js";
-import { loadImageSrc, invoke } from "./api.js";
+import { state, on, emit, persistSettings, rescanSkin, JUDGE_KEYS } from "./state.js";
+import { loadImageSrc, invoke, setWindowFullscreen } from "./api.js";
 import { SkinManager } from "./manager.js";
 import { NOTE_LAYOUT, findManiaSection } from "./skin_ini.js";
 import { _num, _num_list, _choice, rgb_to_hex } from "./utilities.js";
@@ -64,13 +64,25 @@ const FAIL_BUTTONS = [
 
 const MAGIC_SCALE = 1.6; // x768(SD) → x480 预览换算
 
-const PAGES = ["游玩界面", "暂停界面", "失败界面", "成绩结算界面", "选歌界面", "对局预览"];
+const PAGES = ["游玩界面", "动态预览", "暂停界面", "失败界面", "成绩结算界面", "选歌界面"];
 
-// 对局预览滚动参数：visibleMs = 11485 / 下落速度（参考 Beatmap_Preview_v 的
-// BASE_MS_VISIBLE=11485，speed 1~40，数字越大 note 下落越快）。
+// 动态预览滚动参数（官方 DrawableManiaRuleset）：
+//   ComputeScrollTime(speed) = MAX_TIME_RANGE / speed（MAX_TIME_RANGE = 11485，speed 1~40）
+//   音符线速度 = 基准距离 × speed / 11485（unit/ms）；基准距离取默认判定线到屏幕顶端的 402
+//   改判定线高度时可见提前量按 (hitY / 402) 等比缩放，速度恒定（见 _playScrollVel）
 const PLAY_BASE_MS_VISIBLE = 11485;
-const PLAY_HIT_FLASH = 180;     // 打击后按键/灯光/判定反馈保留时长（ms）
+const PLAY_REF_HIT_Y = 402;     // 官方 DEFAULT_HIT_POSITION：默认判定线距屏幕顶端 402（unit）
+const PLAY_HIT_FLASH = 180;     // 打击后按键/灯光保留时长（ms）
+const PLAY_KEY_RELEASE_DELAY = 80; // 官方 LegacyKeyArea：松开后 Delay(80) 才切回抬起图
+const PLAY_LIGHT_OUT = 250;     // 官方 LegacyColumnBackground：松开后 250ms 淡出并纵向压扁
 const PLAY_SPEED_MIN = 1, PLAY_SPEED_MAX = 40;
+const PLAY_LIGHT_FPS_DEFAULT = 60; // 官方 LightFramePerSecond 默认 60（解码器把 ≤0 归为 24）
+
+// 打击反馈时长（官方 LegacyHitExplosion：FadeIn 80 + FadeOut 120）
+const PLAY_EXPLODE_IN = 80, PLAY_EXPLODE_OUT = 120;
+// 判定图时长（官方 LegacyManiaJudgementPiece：FadeIn 20 + Delay 160 + FadeOut 40）
+const PLAY_JUDGE_IN = 20, PLAY_JUDGE_HOLD = 160, PLAY_JUDGE_OUT = 40;
+const PLAY_JUDGE_TOTAL = PLAY_JUDGE_IN + PLAY_JUDGE_HOLD + PLAY_JUDGE_OUT;
 
 // ---------------------------------------------------------------------------
 // 模块内部状态
@@ -90,11 +102,16 @@ let _p = {
   hitPick: null,      // 当前选中的命中元素（用于绘制高亮框）
   imgCache: new Map(),   // path -> {img, w, h, failed}（w/h 为 @2x 减半后的 1x 逻辑尺寸）
   tintCache: new Map(),  // img + rgb -> 着色后的 canvas
+  animCache: new Map(),  // (ini 值|默认名) -> 动画帧文件路径列表
   holdCache: new Map(),  // 长条 body 合成图缓存
   digitCache: new Map(), // (prefix, ch) -> 数字皮肤图路径
   timer: 0,
   resizeObs: null,
-  play: null,            // 对局预览状态（见 _playReset）
+  host: null,            // 预览容器（.preview-host），用于把控制行放到画布下方
+  play: null,            // 动态预览状态（见 _playReset）
+  fullscreen: false,     // 是否处于全屏播放（F11 / 控制行按钮）
+  fsDom: false,          // 是否走了 DOM 全屏回退（仅浏览器调试环境，需监听 Esc 退出）
+  fsKeysBound: false,    // F11 快捷键是否已绑定（renderPreview 会被重复调用）
 };
 
 // ---------------------------------------------------------------------------
@@ -283,6 +300,40 @@ function _resolvePath(iniValue, ...defaultBases) {
   return null;
 }
 
+/**
+ * 动画帧文件路径列表（官方 LegacySkinExtensions.GetAnimation 语义）：
+ * 先试「名-0、名-1 …」连续编号帧，无编号帧时回退单张「名」。
+ * 返回路径数组（可能为空）；按名缓存，换皮肤时随 imgCache 一并清空。
+ */
+function _animPaths(iniValue, base) {
+  const names = [];
+  if (iniValue) {
+    let probe = String(iniValue).trim().replace(/^"|"$/g, "");
+    const m = probe.match(/\.(png|gif|jpg|jpeg)$/i);
+    if (m) probe = probe.slice(0, -m[0].length);
+    if (probe) names.push(probe);
+  }
+  if (!names.includes(base)) names.push(base);
+  const key = names.join("|");
+  const cached = _p.animCache.get(key);
+  if (cached) return cached;
+
+  let out = [];
+  for (const name of names) {
+    const frames = [];
+    for (let i = 0; i < 1024; i++) {
+      const p = _mgrPath(`${name}-${i}`);
+      if (!p) break;
+      frames.push(p);
+    }
+    if (frames.length) { out = frames; break; }
+    const single = _mgrPath(name);
+    if (single) { out = [single]; break; }
+  }
+  _p.animCache.set(key, out);
+  return out;
+}
+
 function _parseRgba(text, defaultArr = [0, 0, 0, 255]) {
   const parts = text ? String(text).split(",").map((s) => s.trim()) : [];
   if (parts.length < 3) return defaultArr;
@@ -340,8 +391,9 @@ function _pick(filename, x, y, w, h) {
   _p.pickables.push({ filename, x, y, w, h });
 }
 
-/** 用皮肤数字图渲染一串字符；prefix 为 null（字段留空）时整体不绘制。 */
-function _drawNumber(text, prefix, cx, cy, anchor, digitH, overlap, pickTag) {
+/** 用皮肤数字图渲染一串字符；prefix 为 null（字段留空）时整体不绘制。
+ * tint（[r,g,b]）非空时对数字图做乘法着色（官方 Drawable.Colour 语义）。 */
+function _drawNumber(text, prefix, cx, cy, anchor, digitH, overlap, pickTag, tint) {
   if (prefix == null) return;
   const ctx = _p.ctx;
   const items = [];
@@ -363,10 +415,11 @@ function _drawNumber(text, prefix, cx, cy, anchor, digitH, overlap, pickTag) {
   else if (anchor === "right") x = cx - totalW;
   for (const it of items) {
     if (it.ent) {
-      _drawEl(it.ent.img, x, cy, it.w, digitH);
+      const src = tint ? _tintEl(it.ent.img, tint) : null;
+      _drawEl(src || it.ent.img, x, cy, it.w, digitH);
     } else {
       ctx.save();
-      ctx.fillStyle = "#ffffff";
+      ctx.fillStyle = tint ? `rgb(${tint[0]},${tint[1]},${tint[2]})` : "#ffffff";
       ctx.font = `bold ${Math.max(digitH * 0.8, 8)}px "Microsoft YaHei UI"`;
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
@@ -488,37 +541,106 @@ function _drawStageBottom(path, centerX, bottomY, scale, upside, tag) {
   _pick(tag, centerX - w / 2, bottomY - h, w, h);
 }
 
-/** 合成长条 body 图（带缓存）：0=拉伸，1=从顶级联，2=从底级联；ColourHold 覆盖颜色。 */
+/**
+ * NoteBodyStyle → 平铺锚点表（osu!stable / wiki 语义）。
+ *
+ * wiki（skin.ini，Version ≥ 2.5 起生效）：0 = Stretch / 1 = Cascade from top /
+ * 2 = Cascade from bottom，默认 1；stable 枚举另含 3 = RepeatBottom、
+ * 4 = RepeatTopAndBottom（wiki 未描述，此处按枚举字面含义补全）。
+ * 对齐关系按「上 = 面尾（远端）、下 = 面头（判定线侧）」的逻辑朝向给出；
+ * 倒置舞台时由 flipV 整体垂直镜像（见 _drawHoldBody）。
+ *
+ * @returns {Array<{fromTop:boolean, texBottom:boolean}>} 平铺起点；空数组 = 值不合法
+ */
+function _holdBodyAnchors(style) {
+  switch (style) {
+    case 1: // Cascade from top：从面尾起铺，贴图顶端(v=0)贴住面尾
+      return [{ fromTop: true, texBottom: false }];
+    case 2: // Cascade from bottom：从面头起铺，贴图底端(v=1)贴住面头
+      return [{ fromTop: false, texBottom: true }];
+    case 3: // RepeatBottom：从面头起铺，贴图顶端(v=0)贴住面头
+      return [{ fromTop: false, texBottom: false }];
+    case 4: // RepeatTopAndBottom：面尾、面头两端同时起铺
+      return [
+        { fromTop: true, texBottom: false },
+        { fromTop: false, texBottom: true },
+      ];
+    default:
+      return [];
+  }
+}
+
+/**
+ * 在像素区间 [top, bottom] 内把长条身体贴图按 tile 高度平铺一次。
+ * @param {boolean} fromTop   true：从 top 端起铺；false：从 bottom 端起铺
+ * @param {boolean} texBottom true：贴图底端(v=1)对齐起点；false：贴图顶端(v=0)对齐起点
+ */
+function _tileBodyInto(ctx, ent, dx, dw, top, bottom, tile, fromTop, texBottom) {
+  if (!(tile > 0)) return;
+  const n = Math.ceil((bottom - top) / tile);
+  for (let i = 0; i < n; i++) {
+    const y0 = fromTop ? top + i * tile : bottom - (i + 1) * tile; // 该张平铺的上边界
+    const y1 = y0 + tile;
+    const vt = Math.max(top, y0);
+    const vb = Math.min(bottom, y1);
+    if (vb <= vt) continue;
+    // 起点到可见区两端的距离（0 = 起点所在边）→ 贴图内的归一化纵向坐标
+    const dB = fromTop ? vt - y0 : y1 - vb;
+    const dT = fromTop ? vb - y0 : y1 - vt;
+    const vB = texBottom ? 1 - dB / tile : dB / tile;
+    const vT = texBottom ? 1 - dT / tile : dT / tile;
+    const srcH = ent.h * Math.abs(vT - vB);
+    if (!(srcH > 0)) continue;
+    // 目的矩形上下边界取整：相邻两片的边界由同一组网格位置递推得出，取整后仍严丝合缝，
+    // 可避免亚像素定位产生的 1px 抗锯齿接缝（原实现即按整数 step 平铺）。
+    const ya = Math.round(vt);
+    const yb = Math.max(ya + 1, Math.round(vb));
+    ctx.drawImage(ent.img, 0, ent.h * Math.min(vB, vT), ent.w, srcH, dx, ya, dw, yb - ya);
+  }
+}
+
+/**
+ * 把长条身体贴图绘制到像素区间 [top, bottom]（左边界 dx、宽 dw）。
+ * style 0 = 整张贴图拉伸；1~4 = 按 _holdBodyAnchors 平铺；其余值退化为拉伸。
+ * flipV = true 时整体垂直镜像（倒置舞台）；镜像轴取区间中点，而区间关于中点对称，
+ * 故镜像后的可见区间仍是 [top, bottom]，内部平铺算式无需改动。
+ *
+ * @param {number} tile 单张平铺高度（像素，按 WidthForNoteHeightScale 等比换算）
+ */
+function _drawHoldBody(ctx, ent, dx, dw, top, bottom, tile, style, flipV) {
+  const h = bottom - top;
+  if (h <= 0 || !ent || ent.w <= 0 || ent.h <= 0) return;
+  const anchors = _holdBodyAnchors(style);
+  if (style === 0 || anchors.length === 0) {
+    ctx.drawImage(ent.img, 0, 0, ent.w, ent.h, dx, top, dw, h);
+    return;
+  }
+  if (flipV) {
+    ctx.save();
+    ctx.translate(0, top + bottom);
+    ctx.scale(1, -1);
+  }
+  for (const a of anchors) _tileBodyInto(ctx, ent, dx, dw, top, bottom, tile, a.fromTop, a.texBottom);
+  if (flipV) ctx.restore();
+}
+
+/** 合成长条 body 图（带缓存）。样式 0~4 语义见 _holdBodyAnchors。
+ * 画布按「上 = 面尾、下 = 面头」的下落朝向生成，绘制时再由 flipNotes 决定是否镜像。
+ * ColourHold 覆盖颜色。 */
 function _buildHoldBody(bodyPath, noteBodyStyle, bodyW, targetH, noteRefW, scale, holdRgba) {
   const key = `${bodyPath}|${noteBodyStyle}|${Math.round(bodyW)}|${Math.round(targetH)}|${noteRefW}|${scale}|${holdRgba.slice(0, 3).join(",")}`;
-  let hit = _p.holdCache.get(key);
+  const hit = _p.holdCache.get(key);
   if (hit) return hit;
   const ent = _imgEntLoaded(bodyPath);
   if (!ent || ent.w <= 0 || ent.h <= 0) return null;
-  const iw = ent.w, ih = ent.h;
-  const k = noteRefW / iw; // 公共缩放比
-  const tileH = ih * k * scale; // 单张 body 等比后的高度（像素）
+  const iw = ent.w;
   const c = document.createElement("canvas");
   c.width = Math.max(1, Math.round(bodyW));
   c.height = Math.max(1, Math.round(targetH));
   const g = c.getContext("2d");
-  if (noteBodyStyle === 0) {
-    // 拉伸样式：单张图直接拉伸填满（不保持宽高比）
-    g.drawImage(ent.img, 0, 0, c.width, c.height);
-  } else if (tileH >= targetH) {
-    // 单张足够：按样式取向一侧裁剪
-    const srcH = Math.max(1, Math.min(Math.round(targetH / k), ih));
-    const sy = noteBodyStyle === 2 ? ih - srcH : 0;
-    g.drawImage(ent.img, 0, sy, iw, srcH, 0, 0, c.width, c.height);
-  } else {
-    // 单张不够：等比缩放单张后平铺到所需高度（整张源图缩放到 列宽×step）
-    const step = Math.max(1, Math.round(tileH));
-    if (noteBodyStyle === 2) {
-      for (let y = c.height - step; y > -step; y -= step) g.drawImage(ent.img, 0, 0, iw, ih, 0, y, c.width, step);
-    } else {
-      for (let y = 0; y < c.height; y += step) g.drawImage(ent.img, 0, 0, iw, ih, 0, y, c.width, step);
-    }
-  }
+  // 单张平铺高度 = 贴图按基准宽(noteRefW)等比缩放后的高度 × 像素倍率
+  const tile = Math.max(1, (ent.h * noteRefW / iw) * scale);
+  _drawHoldBody(g, ent, 0, c.width, 0, c.height, tile, noteBodyStyle, false);
   // ColourHold 覆盖长条身体颜色（默认白色 = 不变，跳过乘算避免重建；
   // 与 PIL ImageChops.multiply 一致：仅乘 RGB、保持 alpha，透明区不染色）
   if (holdRgba[0] !== 255 || holdRgba[1] !== 255 || holdRgba[2] !== 255) {
@@ -639,7 +761,7 @@ function _drawPlaySkip(sx, sy, screenW, screenH, scale) {
 }
 
 // ---------------------------------------------------------------------------
-// 对局预览：按时间驱动的动态下落渲染
+// 动态预览：按时间驱动的动态下落渲染
 // ---------------------------------------------------------------------------
 
 function _playReset() {
@@ -652,20 +774,68 @@ function _playReset() {
     raf: 0,
     last: undefined, // 上一帧时间（手动时钟用）
     manualMs: 0,     // 无音频时的节目时间（ms）
-    speed: 25,       // 下落速度（1~40，越大下落越快，参考 Beatmap_Preview_v）
+    clock: null,     // 音频主时钟锚点 {raw, at}（见 _playTimeMs）
+    actx: null,      // 仅用于测量输出延迟的 AudioContext
+    latencyMs: 0,    // 输出延迟（ms）
+    latencyDone: false, // 是否已探测过输出延迟（一次性）
+    events: null,    // 判定事件流（见 _playBuildEvents）
+    judgeKey: null,  // 生成 events 时用的判定权重快照（权重变化时据此重建）
+    bgPath: null,    // 谱面自带背景图（游玩时替换皮肤 bg）
+    speed: state.settings.play_speed, // 下落速度（1~40，越大下落越快；随设置持久化）
     // 进度条缓存（避免每帧重建）
-    playBtn: null, progress: null, speedSel: null, timeLbl: null, titleLbl: null, ctl: null,
+    playBtn: null, progress: null, speedSel: null, speedVal: null, timeLbl: null, titleLbl: null, ctl: null,
+    fsBtn: null,      // 全屏播放按钮
   };
   return _p.play;
 }
 
-/** 当前音乐绝对时间（ms）：有音频读 audio.currentTime，否则用手动时钟。 */
+/**
+ * 输出延迟（ms）：让画面与「听到」的声音对齐。
+ * HTMLAudioElement 不提供时间戳，退而用 AudioContext.outputLatency 估算；
+ * 不支持时返回 0（不补偿）。
+ */
+function _playLatencyMs() {
+  const p = _p.play;
+  if (!p || p.latencyDone) return p ? p.latencyMs : 0;
+  p.latencyDone = true;
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (AC) {
+      p.actx = p.actx || new AC();
+      const v = p.actx.outputLatency || p.actx.baseLatency;
+      if (isFinite(v) && v > 0) p.latencyMs = v * 1000;
+    }
+  } catch (e) { /* 不支持则不补偿 */ }
+  return p.latencyMs || 0;
+}
+
+/**
+ * 当前音乐绝对时间（ms）——音频主时钟（参考 SkinDeck）：
+ * 以 audio.currentTime 为锚点、帧间用 performance.now() 单调插值，
+ * 避免 currentTime 量化步进（4~16ms）造成的音符抖动；再扣除输出延迟。
+ * 无音频时退回手动时钟。
+ */
 function _playTimeMs() {
   const p = _p.play;
   if (!p) return 0;
-  if (p.audio && isFinite(p.audio.currentTime)) return p.audio.currentTime * 1000;
-  return p.manualMs;
+  const a = p.audio;
+  if (!a || !isFinite(a.currentTime)) return p.manualMs;
+
+  const raw = a.currentTime * 1000;
+  if (a.paused || a.ended) { p.clock = null; return raw; }
+
+  const now = performance.now();
+  const c = p.clock;
+  // 首次、或与插值偏差过大（seek / 缓冲卡顿）→ 重新锚定
+  if (!c || Math.abs(raw - (c.raw + (now - c.at))) > 60) {
+    p.clock = { raw, at: now };
+  } else {
+    const smooth = c.raw + (now - c.at);
+    return Math.max(0, Math.min(smooth, raw + 120) - _playLatencyMs());
+  }
+  return Math.max(0, raw - _playLatencyMs());
 }
+
 
 function _playDurMs() {
   const p = _p.play;
@@ -674,11 +844,152 @@ function _playDurMs() {
   return Math.max(audioDur, p.bm.durationMs, 1);
 }
 
-function _playVisibleMs() {
+/** 音符下落线速度（unit/ms）：只由下落速度决定，与判定线高度无关。
+ *  官方 DrawableManiaRuleset.updateTimeRange() 以 (768 - hitPosition) / (768 - DEFAULT_HIT_POSITION)
+ *  缩放 TimeRange，从而让「判定线到屏幕顶端的距离」与可见时间同比例变化，速度保持恒定；
+ *  本工具坐标系为 480 高、判定线距顶端 hitY，故基准距离取 402。 */
+function _playScrollVel() {
   const p = _p.play;
   const sp = p && p.speed ? p.speed : 1;
-  return PLAY_BASE_MS_VISIBLE / sp;
+  return PLAY_REF_HIT_Y * sp / PLAY_BASE_MS_VISIBLE;
 }
+
+/** 音频扩展名 -> MIME（Blob 无类型时 WebView2 可能拒绝解码）。 */
+function _audioMime(path) {
+  const ext = (path.match(/\.([^.\\/]+)$/) || [])[1];
+  switch (ext && ext.toLowerCase()) {
+    case "mp3": return "audio/mpeg";
+    case "ogg": case "oga": return "audio/ogg";
+    case "wav": return "audio/wav";
+    case "flac": return "audio/flac";
+    case "m4a": case "mp4": case "aac": return "audio/mp4";
+    default: return "audio/mpeg";
+  }
+}
+
+// ---- 判定事件流（预览用）---------------------------------------------------
+// 预览没有真实输入，按「确定性伪随机」模拟一份判定分布，用来同时预览
+// 判定图 / 打击爆炸 / 连击 / 分数 / 准确率。同一物件每帧结果一致。
+// 权重可在设置中调整（judge_weights），总和不必为 1000 —— 内部按总和归一。
+
+/** 当前判定权重表（顺序见 JUDGE_KEYS）；非法值按 0 处理。 */
+function _judgeWeights() {
+  const w = state.settings.judge_weights || {};
+  const out = [];
+  for (const k of JUDGE_KEYS) {
+    const v = Number(w[k]);
+    out.push([k, Number.isFinite(v) && v > 0 ? v : 0]);
+  }
+  if (!out.some(([, v]) => v > 0)) out[0] = [out[0][0], 1]; // 全 0 → 视为全 Perfect，避免除零
+  return out;
+}
+
+/** 权重表快照（用于判断是否需要重建事件流）。 */
+function _judgeKey() {
+  return JUDGE_KEYS.map((k) => state.settings.judge_weights?.[k] ?? "").join("/");
+}
+/**
+ * 官方 mania 计分（osu.Game.Rulesets.Mania.Scoring.ManiaScoreProcessor）。
+ * 准确率基值 GetBaseScoreForResult：Perfect=305，其余取基类
+ * （Great=300 / Good=200 / Ok=100 / Meh=50 / Miss=0）。
+ */
+const PLAY_BASE_SCORE = { "300g": 305, "300": 300, "200": 200, "100": 100, "50": 50, "miss": 0 };
+/** 连击加成基值 getBaseComboScoreForResult：Perfect=300，其余同准确率基值。 */
+const PLAY_COMBO_BASE = { "300g": 300, "300": 300, "200": 200, "100": 100, "50": 50, "miss": 0 };
+/** 每判定连击加成的上限 log_4(400)（ManiaScoreProcessor.combo_base = 4）。 */
+const PLAY_COMBO_LOG_MAX = Math.log(400) / Math.log(4);
+
+/** 单个判定的连击加成分量：base × clamp(log₄(comboAfter), 0.5, log₄(400))。 */
+function _playComboChange(res, comboAfter) {
+  const base = PLAY_COMBO_BASE[res] || 0;
+  if (base === 0) return 0;
+  const v = Math.min(Math.max(0.5, Math.log(comboAfter) / Math.log(4)), PLAY_COMBO_LOG_MAX);
+  return base * v;
+}
+
+/** 按权重表取该物件的判定结果（确定性：同 seed 恒同结果）。 */
+function _playJudge(seed, table) {
+  let total = 0;
+  for (const [, w] of table) total += w;
+  const h = (Math.imul(seed + 1, 2654435761) >>> 0) % total;
+  let acc = 0;
+  for (const [res, w] of table) {
+    acc += w;
+    if (h < acc) return res;
+  }
+  return table[0][0];
+}
+
+/**
+ * 构建判定事件流：普通音符 1 个事件；长条头/尾各 1 个（与官方一致，分别计连击）。
+ * 同时预算前缀状态（连击 / 分数 / 准确率权重和），渲染时二分取用，O(log n)。
+ */
+function _playBuildEvents(bm, keys) {
+  const objs = bm.hitObjects;
+  const jt = _judgeWeights(); // 权重表取一次，避免逐物件重复构造
+  const raw = [];
+  for (let k = 0; k < objs.length; k++) {
+    const o = objs[k];
+    const i = Math.floor(o.x * keys / 512);
+    if (i < 0 || i >= keys) continue;
+    raw.push({ t: o.time, i, tail: false, r: _playJudge(k, jt) });
+    if ((o.type & 128) && o.endTime > o.time) {
+      raw.push({ t: o.endTime, i, tail: true, r: _playJudge(k + 1000003, jt) });
+    }
+  }
+  raw.sort((a, b) => a.t - b.t);
+
+  const n = raw.length;
+  const t = new Array(n), i = new Array(n), r = new Array(n), tail = new Array(n);
+  const pCombo = new Array(n + 1).fill(0);
+  const pBase = new Array(n + 1).fill(0);          // currentBaseScore
+  const pComboPortion = new Array(n + 1).fill(0);  // currentComboPortion
+  const breaks = [];                               // 断连点 {t, combo}（供连击 pop-out）
+  for (let k = 0; k < n; k++) {
+    t[k] = raw[k].t; i[k] = raw[k].i; r[k] = raw[k].r; tail[k] = raw[k].tail;
+    const res = r[k];
+    // IncreasesCombo = AffectsCombo && IsHit；miss 断连
+    const combo = res === "miss" ? 0 : pCombo[k] + 1;
+    if (res === "miss" && pCombo[k] > 0) breaks.push({ t: t[k], combo: pCombo[k] });
+    pCombo[k + 1] = combo;
+    pBase[k + 1] = pBase[k] + (PLAY_BASE_SCORE[res] || 0);
+    pComboPortion[k + 1] = pComboPortion[k] + _playComboChange(res, combo);
+  }
+  // 官方：maximumComboPortion 由「全 Perfect 的自动播放」模拟得出（连击 1..n）
+  let maxComboPortion = 0;
+  for (let c = 1; c <= n; c++) maxComboPortion += _playComboChange("300g", c);
+  return { t, i, r, tail, pCombo, pBase, pComboPortion, maxComboPortion, n, breaks };
+}
+
+/** 判定权重变化后重建事件流（权重未变则跳过，避免每次设置变更都重算）。 */
+function _syncJudgeEvents() {
+  const p = _p.play;
+  if (!p || !p.bm) return;
+  const key = _judgeKey();
+  if (p.judgeKey === key) return;
+  p.judgeKey = key;
+  p.events = _playBuildEvents(p.bm, p.keys);
+}
+
+/**
+ * 当前时间下的连击 / 分数 / 准确率（官方 ManiaScoreProcessor.ComputeTotalScore）：
+ *   150000 × comboProgress
+ * + 850000 × Accuracy^(2 + 2×Accuracy) × accuracyProgress
+ * + bonusPortion（mania 无 bonus，恒为 0）
+ * Accuracy = currentBaseScore / currentMaximumBaseScore，其中每判定 MaxResult=Perfect(305)。
+ */
+function _playStatsAt(ev, t) {
+  const k = bisectLeft(ev.t, t);
+  const maxBase = 305 * k;
+  const acc = maxBase > 0 ? ev.pBase[k] / maxBase : 1;
+  const comboProgress = ev.maxComboPortion > 0 ? ev.pComboPortion[k] / ev.maxComboPortion : 1;
+  const accuracyProgress = ev.n > 0 ? k / ev.n : 1;
+  const score = k > 0
+    ? Math.round(150000 * comboProgress + 850000 * Math.pow(acc, 2 + 2 * acc) * accuracyProgress)
+    : 0;
+  return { combo: ev.pCombo[k], score, acc: acc * 100 };
+}
+
 
 /** 导入铺面（选择 .osu，音频按 AudioFilename 自动在谱面目录查找；未找到才用多选的音频）。 */
 async function _importBeatmap() {
@@ -691,17 +1002,29 @@ async function _importBeatmap() {
   }
   const osuPath = files.find((f) => /\.osu$/i.test(f));
   if (!osuPath) { toast("未选择 .osu 谱面文件", "error"); return; }
+  await _loadBeatmap(osuPath, files, false);
+}
+
+/**
+ * 载入谱面（「导入铺面」按钮与启动恢复共用）。
+ * @param {string} osuPath .osu 路径
+ * @param {string[]} files 同一对话框内选中的其它文件（可能含音频；恢复时为 []）
+ * @param {boolean} restore 启动恢复：失败静默（由调用方清除记录）、不写记录、不强制切页
+ * @returns {Promise<boolean>} 是否载入成功
+ */
+async function _loadBeatmap(osuPath, files, restore) {
+  const fail = (msg) => { if (!restore) toast(msg, "error"); return false; };
   let osuText;
   try {
     const r = await invoke("read_text", { path: osuPath });
     osuText = r && r.text;
-  } catch (e) { toast(`读取谱面失败：${e.message || e}`, "error"); return; }
-  if (!osuText || !osuText.includes("[HitObjects]")) { toast("谱面文件无效（缺少 [HitObjects]）", "error"); return; }
+  } catch (e) { return fail(`读取谱面失败：${e.message || e}`); }
+  if (!osuText || !osuText.includes("[HitObjects]")) return fail("谱面文件无效（缺少 [HitObjects]）");
 
   let bm;
   try { bm = parseOsuBeatmap(osuText); }
-  catch (e) { toast(`解析谱面失败：${e.message || e}`, "error"); return; }
-  if (bm.mode !== 3) { toast("非 osu!mania 谱面（未支持其他模式）", "error"); return; }
+  catch (e) { return fail(`解析谱面失败：${e.message || e}`); }
+  if (bm.mode !== 3) return fail("非 osu!mania 谱面（未支持其他模式）");
 
   const p = _p.play || _playReset();
   // 释放旧音频
@@ -712,6 +1035,10 @@ async function _importBeatmap() {
   p.playing = false;
   p.manualMs = 0;
   p.last = undefined;
+  p.clock = null;
+  p.judgeKey = null; // 判定权重可能已被修改 → 强制重建事件流
+  _syncJudgeEvents();
+  p.lnSpan = undefined; // 本谱面的最长长条时长（首帧惰性统计）
 
   // 音频：优先按 AudioFilename 在谱面目录（递归）查找；找不到则用文件对话框里一并选的
   let audioPath = null;
@@ -727,7 +1054,7 @@ async function _importBeatmap() {
     try {
       const bytes = await invoke("read_file_bytes", { path: audioPath });
       if (bytes && bytes.byteLength) {
-        p.audioUrl = URL.createObjectURL(new Blob([bytes]));
+        p.audioUrl = URL.createObjectURL(new Blob([bytes], { type: _audioMime(audioPath) }));
         const a = new Audio(p.audioUrl);
         a.preload = "auto";
         a.addEventListener("ended", _playOnEnded);
@@ -736,9 +1063,33 @@ async function _importBeatmap() {
     } catch (e) { toast(`音频加载失败：${e.message || e}`, "error"); }
   }
 
-  toast(`已导入：${bm.title}（${p.keys}K / ${Math.round(bm.bpm)}BPM / ${bm.noteCount} 音符${bm.lnCount ? " +" + bm.lnCount + " 长条" : ""}${audioPath ? "，已带音频" : "，无音频"}）`);
-  _playSwitchTo("对局预览");
+  // 背景：官方游玩界面显示歌曲背景（谱面自带图），而非皮肤 menu-background
+  p.bgPath = null;
+  if (bm.backgroundFilename) {
+    try { p.bgPath = await invoke("find_file_by_name", { folder: dir, name: bm.backgroundFilename }); }
+    catch (e) { p.bgPath = null; }
+  }
+
+  toast(`${restore ? "已恢复上次谱面" : "已导入"}：${bm.title}（${p.keys}K / ${Math.round(bm.bpm)}BPM / ${bm.noteCount} 音符${bm.lnCount ? " +" + bm.lnCount + " 长条" : ""}${audioPath ? "，已带音频" : "，无音频"}）`);
+  if (!restore) {
+    state.settings.last_beatmap = osuPath; // 记住谱面，下次启动自动恢复
+    persistSettings();
+    _playSwitchTo("动态预览");
+  }
   _schedulePlayLoop();
+  return true;
+}
+
+/** 启动时恢复上次载入的谱面；文件已被删除/移走则清除记录（避免每次启动都白试一次）。 */
+async function _restoreLastBeatmap() {
+  const path = state.settings.last_beatmap;
+  if (!path) return;
+  if (await _loadBeatmap(path, [], true)) {
+    _syncPlayCtl(); // 恢复流程不切页，需按当前页同步控制行显隐
+  } else {
+    state.settings.last_beatmap = "";
+    persistSettings();
+  }
 }
 
 function _playToggle() {
@@ -752,11 +1103,15 @@ function _playStart() {
   const p = _p.play;
   if (!p || !p.bm) return;
   p.playing = true;
+  p.clock = null; // 重新锚定主时钟
   if (p.audio) {
     p.audio.play().then(() => {
       if (!p) return;
       p.playing = true;
-    }).catch(() => { p.playing = false; });
+    }).catch((e) => {
+      p.playing = false;
+      toast(`音频播放失败：${e.message || e}`, "error");
+    });
   }
   _schedulePlayLoop();
 }
@@ -765,6 +1120,7 @@ function _playPause() {
   const p = _p.play;
   if (!p) return;
   p.playing = false;
+  p.clock = null;
   if (p.audio) p.audio.pause();
 }
 
@@ -779,6 +1135,7 @@ function _playSeek(ms) {
   if (!p || !p.bm) return;
   ms = Math.max(0, Math.min(ms, _playDurMs()));
   p.manualMs = ms;
+  p.clock = null; // 跳转后重新锚定主时钟
   if (p.audio) {
     try { p.audio.currentTime = ms / 1000; } catch (e) { /* ignore */ }
   }
@@ -787,10 +1144,12 @@ function _playSeek(ms) {
 function _playSetSpeed(sp) {
   const p = _p.play;
   if (!p) return;
-  // 下落速度（1~40）：只影响 note 可见窗口（visibleMs），不影响音乐播放速度
+  // 下落速度（1~40）：决定音符线速度（unit/ms，见 _playScrollVel），不影响音乐播放速度
   const n = parseInt(sp, 10);
   p.speed = Math.max(PLAY_SPEED_MIN, Math.min(PLAY_SPEED_MAX, isNaN(n) ? 25 : n));
+  state.settings.play_speed = p.speed; // 记住下落速度（松手时由 change 事件持久化）
   if (p.speedSel) p.speedSel.value = String(p.speed);
+  if (p.speedVal) p.speedVal.textContent = String(p.speed);
 }
 
 function _schedulePlayLoop() {
@@ -810,12 +1169,12 @@ function _stopPlayLoop() {
 function _playLoop() {
   const p = _p.play;
   if (!p || !_p.canvas) return;
-  if (_pv("page", "游玩界面") !== "对局预览") {
-    p.raf = 0; // 页面已离开对局预览，停止循环
+  if (_pv("page", "游玩界面") !== "动态预览") {
+    p.raf = 0; // 页面已离开动态预览，停止循环
     return;
   }
 
-  // 推进时间（speed 只影响下落可见窗口，音乐/时钟始终正常速度）
+  // 推进时间（下落速度只影响音符线速度，音乐/时钟始终正常速度）
   if (p.playing) {
     const now = performance.now();
     if (p.last !== undefined) {
@@ -857,269 +1216,419 @@ function _updatePlayUI() {
 }
 
 function _playIsActive() {
-  return !!(_p.play && _p.play.bm && _pv("page", "游玩界面") === "对局预览");
+  return !!(_p.play && _p.play.bm && _pv("page", "游玩界面") === "动态预览");
+}
+
+// ---- 打击反馈动画曲线（官方 LegacyManiaJudgementPiece / LegacyHitExplosion）----
+
+/** 判定图不透明度：FadeIn 20 → 保持 160 → FadeOut 40。 */
+function _playJudgeAlpha(dt) {
+  if (dt < PLAY_JUDGE_IN) return dt / PLAY_JUDGE_IN;
+  if (dt < PLAY_JUDGE_IN + PLAY_JUDGE_HOLD) return 1;
+  const k = (dt - PLAY_JUDGE_IN - PLAY_JUDGE_HOLD) / PLAY_JUDGE_OUT;
+  return k >= 1 ? 0 : 1 - k;
+}
+
+/** 判定图缩放：0.8→1(40) → 0.85 → 0.7(40) → 停 100 → 0.4(40)。 */
+function _playJudgeScale(dt) {
+  if (dt < 40) return 0.8 + 0.2 * (dt / 40);
+  if (dt < 80) return 0.85 - 0.15 * ((dt - 40) / 40);
+  if (dt < 180) return 0.7;
+  return Math.max(0.4, 0.7 - 0.3 * ((dt - 180) / 40));
+}
+
+/** 打击爆炸不透明度：FadeIn 80 → FadeOut 120。 */
+function _playExplodeAlpha(dt) {
+  if (dt < PLAY_EXPLODE_IN) return dt / PLAY_EXPLODE_IN;
+  const k = (dt - PLAY_EXPLODE_IN) / PLAY_EXPLODE_OUT;
+  return k >= 1 ? 0 : 1 - k;
 }
 
 /**
- * 动态对局渲染：画轨道上的基键、按下键、打击灯光、判定反馈，
- * 以及按时间下落的普通音符与 LN（头/身体/尾），参考官方 mania 的 two-phase LN。
+ * 动态对局渲染：接收器、下落音符、长条与打击反馈。
+ *
+ * 坐标：游戏区域恒为 480 unit，Y(u) 负责像素换算与倒置；
+ * 时刻 τ 的「前沿」位于 unit y = hitY - (τ - t) · v。
+ *
+ * 长条按官方 DrawableHoldNote 的三段几何拼接（Hh/Th = 头/尾图高）：
+ *   头    [pos(T) - Hh, pos(T)]        前沿贴判定线，向后（远离判定线）展开
+ *   身体  [pos(E) - Th/2, pos(T) - Hh/2]  两端各伸到头的中线 / 尾的中线
+ *   尾    [pos(E) - Th, pos(E)]        位于远端外侧，纹理垂直翻转（"倒扣"）
+ * 按住时头部钉在判定线，头中线以下的部分被遮罩（等同官方 maskingContainer）。
  */
 function _drawPlayNotes(P) {
   const { ctx, X, Y, scale, cols, keys, vals, layout, flipKeys, flipNotes,
-          upside, hitY, refW, noteBodyStyle } = P;
+          upside, hitY, refW, noteBodyStyle, split, drawHitTarget } = P;
+  const half = keys >> 1; // 分离舞台时的左右分界（与 _draw 一致）
   const play = _p.play;
   const bm = play.bm;
+  const ev = play.events;
   const t = _playTimeMs();
-  const visibleMs = _playVisibleMs();
-  const v = hitY / visibleMs; // 单位坐标 / ms
+  const v = _playScrollVel();  // unit/ms：仅由下落速度决定（与判定线高度无关）
+  const leadMs = hitY / v;     // 可见提前量：判定线越高越短
   const colWpx = (i) => (cols[i][1] - cols[i][0]) * scale;
+  const colX = (i) => X(cols[i][0]);
   const cxpx = (i) => X((cols[i][0] + cols[i][1]) / 2);
+  const posAt = (tau) => hitY - (tau - t) * v; // 时刻 τ 的「前沿」unit 坐标
+  const keysUnder = _bool(vals.get("KeysUnderNotes")); // 按键是否绘制在音符之下
 
-  const keyH = (_img) => { const e = _img; return e && e.h > 0 ? Math.max(1, Math.round(e.h * scale / 1.6)) : 0; };
-
-  // 普通音符图片（非 LN 轨）
-  const normalImg = (i) => {
-    const cmd = `NoteImage${i}`;
-    const fallback = `mania-note${layout[i]}`;
-    const path = _resolvePath(vals.get(cmd), fallback);
-    return path ? _imgEntLoaded(path) : null;
+  // ---- 贴图解析：官方回退链（layout[i] 即 FallbackColumnIndex）----
+  // 每帧按「ini 值 + 候选名」记忆化，避免同一列在一帧内反复查文件
+  const imgMemo = new Map();
+  const pickImg = (ini, ...bases) => {
+    const key = `${ini || ""}|${bases.join("|")}`;
+    let hit = imgMemo.get(key);
+    if (hit === undefined) {
+      const path = _resolvePath(ini, ...bases);
+      hit = path ? _imgEntLoaded(path) : null;
+      imgMemo.set(key, hit);
+    }
+    return hit;
   };
-  // LN 三件套
-  const lnParts = (i) => {
-    const H = _resolvePath(vals.get(`NoteImage${i}H`), `mania-note${layout[i]}H`);
-    const L = _resolvePath(vals.get(`NoteImage${i}L`), `mania-note${layout[i]}L`);
-    const T = _resolvePath(vals.get(`NoteImage${i}T`), `mania-note${layout[i]}T`);
-    return {
-      H: H ? _imgEntLoaded(H) : null,
-      L: L ? _imgEntLoaded(L) : null,
-      T: T ? _imgEntLoaded(T) : null,
-    };
-  };
-
-  // 用头图/身体存在与否判断该列属于普通还是长条轨道（权重一致即可）；
-  // 具体由谱面对象 type 决定，图片缺失时走默认矩形兜底。
-
-  // ---- 面板预计算每列：最近打击时间、LN 是否按住 ----
-  // （先收集，再统一按“按下时长”画按键/灯光，得到按前/按后反馈）
-  const colPressed = new Array(keys).fill(false);
-  const colHit = new Array(keys).fill(-Infinity);
+  const lb = (i) => layout[i];
+  const noteImg = (i) => pickImg(vals.get(`NoteImage${i}`), `mania-note${lb(i)}`);
+  const headImg = (i) => pickImg(vals.get(`NoteImage${i}H`), `mania-note${lb(i)}H`, `mania-note${lb(i)}`);
+  const tailImg = (i) => pickImg(vals.get(`NoteImage${i}T`), `mania-note${lb(i)}T`, `mania-note${lb(i)}H`, `mania-note${lb(i)}`);
+  const bodyImg = (i) => pickImg(vals.get(`NoteImage${i}L`), `mania-note${lb(i)}L`);
+  // 贴图高 -> unit 高（Height = 纹理高 × WidthForNoteHeightScale / 纹理宽）
+  const unitH = (e) => (e && e.w > 0 ? Math.max(1, e.h * refW / e.w) : 44);
+  const keyH = (e) => (e && e.h > 0 ? Math.max(1, Math.round(e.h * scale / 1.6)) : 0);
 
   const hitIndex = bm.hitIndex;
   const objs = bm.hitObjects;
-  const winS = t - visibleMs * 0.2;
-  const winE = t + visibleMs;
+  if (play.lnSpan === undefined) {
+    let m = 0;
+    for (const ln of hitIndex.lnEnds) m = Math.max(m, ln.end - ln.t);
+    play.lnSpan = m;
+  }
+
+  // ---- 每列按键状态：长条按住 / 最近命中（含长条头尾）----
+  const colHeld = new Array(keys).fill(false);
+  const colHit = new Array(keys).fill(-Infinity);
+  {
+    // 只扫 [t - max(最长长条, 闪光时长), t] 窗口内的长条（滑动窗口，避免全量遍历）
+    const a = bisectLeft(hitIndex.lnEnds, t - Math.max(play.lnSpan, PLAY_HIT_FLASH), "t");
+    const b = bisectLeft(hitIndex.lnEnds, t, "t");
+    for (let k = a; k < b; k++) {
+      const ln = hitIndex.lnEnds[k];
+      const i = Math.floor(objs[ln.idx].x * keys / 512);
+      if (i < 0 || i >= keys) continue;
+      if (ln.end > t) { colHeld[i] = true; colHit[i] = Math.max(colHit[i], ln.t); }
+      else colHit[i] = Math.max(colHit[i], ln.end);
+    }
+    if (ev) {
+      const a2 = bisectLeft(ev.t, t - PLAY_HIT_FLASH);
+      const b2 = bisectLeft(ev.t, t);
+      for (let k = a2; k < b2; k++) colHit[ev.i[k]] = Math.max(colHit[ev.i[k]], ev.t[k]);
+    }
+  }
+  const colPressed = new Array(keys).fill(false);
+  const colDown = new Array(keys).fill(false); // 按下图可见性（官方松开后额外延迟 80ms）
+  for (let i = 0; i < keys; i++) {
+    const dt = t - colHit[i];
+    colPressed[i] = colHeld[i] || dt < PLAY_HIT_FLASH;
+    colDown[i] = colPressed[i] || dt < PLAY_HIT_FLASH + PLAY_KEY_RELEASE_DELAY;
+  }
+
+  // ═══════════════════════ 舞台灯光（列背景层，恒在音符之下） ═══════════════════════
+  // 官方 LegacyColumnBackground：灯光属于列背景（BackgroundContainer），
+  // 恒位于音符之下，不随 KeysUnderNotes 变化。按下瞬间 FadeIn + ScaleTo(1)，
+  // 松开后 250ms FadeTo(0) 且 ScaleTo(1, 0)（纵向压扁到 LightPosition 那条线）；
+  // 贴图为动画序列，帧长 1000 / LightFramePerSecond。
+  const lightPos = _num(vals.get("LightPosition"), 413);
+  const lightFpsRaw = _num(vals.get("LightFramePerSecond"), PLAY_LIGHT_FPS_DEFAULT);
+  const lightFrameLen = 1000 / (lightFpsRaw > 0 ? lightFpsRaw : 24);
+  const lightPaths = _animPaths(vals.get("StageLight"), "mania-stage-light");
+  const drawKeyLights = () => {
+    if (!_showDefaultOn() || !lightPaths.length) return;
+    const lightEnt = _imgEntLoaded(lightPaths[Math.floor(t / lightFrameLen) % lightPaths.length]);
+    if (!lightEnt || lightEnt.w <= 0) return;
+    for (let i = 0; i < keys; i++) {
+      let alpha = 1, kScale = 1;
+      if (!colPressed[i]) {
+        const r = (t - colHit[i] - PLAY_HIT_FLASH) / PLAY_LIGHT_OUT;
+        if (!(r >= 0) || r >= 1) continue; // 未到松开时刻或已淡出完毕
+        alpha = 1 - r;
+        kScale = 1 - r;
+      }
+      const wpx = colWpx(i);
+      const rgb = _parseRgba(vals.get(`ColourLight${i + 1}`), [255, 255, 255, 255]).slice(0, 3);
+      const tinted = _tintEl(lightEnt.img, rgb);
+      if (!tinted) continue;
+      const lh = Math.max(1, wpx * lightEnt.h / lightEnt.w) * kScale;
+      // 官方：BottomCentre 锚在 LightPosition（自下往上生长；倒置时镜像为自顶向下）
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      _drawEl(tinted, colX(i), upside ? Y(lightPos) : Y(lightPos) - lh, wpx, lh);
+      ctx.restore();
+    }
+  };
+
+  // ═══════════════════════ 接收器（基键 / 按下键） ═══════════════════════
+  // KeysUnderNotes（按键被音符覆盖）：官方把 KeyArea 移入 HitObjectArea.UnderlayElements
+  // （音符之下）；默认 0 时 KeyArea 位于 Column 子级末尾 = 音符之上。
+  // 按下/松开为瞬时切换（官方 FadeTo 时长 0），但松开要晚 80ms 才切回抬起图。
+  const drawKeys = () => {
+    for (let i = 0; i < keys; i++) {
+      const wpx = colWpx(i);
+      const x = colX(i);
+      const baseEnt = pickImg(vals.get(`KeyImage${i}`), `mania-key${lb(i)}`);
+      const downEnt = pickImg(vals.get(`KeyImage${i}D`), `mania-key${lb(i)}D`, `mania-key${lb(i)}`);
+
+      if (baseEnt && baseEnt.h > 0) {
+        const kh = keyH(baseEnt);
+        _drawEnt(baseEnt, x, upside ? Y(480) : Y(480) - kh, wpx, kh, false, flipKeys);
+      }
+      if (colDown[i] && downEnt && downEnt.h > 0) {
+        const kh = keyH(downEnt);
+        _drawEnt(downEnt, x, upside ? Y(480) : Y(480) - kh, wpx, kh, false, flipKeys);
+      }
+      if (!baseEnt && _showDefaultOn()) {
+        ctx.fillStyle = colDown[i] ? "#5a5a66" : "#3a3a44";
+        ctx.strokeStyle = "#ffffff";
+        const y0 = Y(hitY), y1 = Y(480);
+        ctx.fillRect(x, y0, wpx, y1 - y0);
+        ctx.strokeRect(x, y0, wpx, y1 - y0);
+      }
+    }
+  };
+
+  drawKeyLights();
+  if (keysUnder) drawKeys();
+  // 命中检测器：官方位于 UnderlayElements 之后、音符之前（见 ColumnHitObjectArea）
+  if (drawHitTarget) drawHitTarget();
+
+  // ═══════════════════════ 音符（下落 / 按住） ═══════════════════════
+  // 单个长条的完整绘制（身体 → 头 → 尾）
+  const drawLn = (i, headEdge, tailEdge, held) => {
+    const wpx = colWpx(i);
+    const x = colX(i);
+    const H = headImg(i), T = tailImg(i), L = bodyImg(i);
+    const hh = unitH(H);            // 头高（unit）
+    const th = unitH(T);            // 尾高（unit）
+    const hBottom = held ? hitY : headEdge; // 按住时头部前沿钉在判定线
+    const hCentre = hBottom - hh / 2;
+    // 按住的遮罩：头中线以下的部分不绘制（官方 maskingContainer）
+    const tEdge = held ? Math.min(tailEdge, hCentre) : tailEdge;
+    const tCentre = tEdge - th / 2;
+    const drawColor = NOTE_COLORS[i % NOTE_COLORS.length];
+
+    // 身体：头中线 -> 尾中线（像素区间用 min/max，兼容倒置）
+    if (tCentre < hCentre) {
+      const ya = Y(tCentre), yb = Y(hCentre);
+      const tp = Math.min(ya, yb), bt = Math.max(ya, yb);
+      if (L && L.w > 0) {
+        // 单张平铺高度按 WidthForNoteHeightScale（refW）等比换算
+        const tile = Math.max(1, (L.h * refW / L.w) * scale);
+        _drawHoldBody(ctx, L, x, wpx, tp, bt, tile, noteBodyStyle, upside);
+      } else if (_showDefaultOn()) {
+        ctx.fillStyle = "rgba(150,180,220,0.35)";
+        ctx.fillRect(x, tp, wpx, bt - tp);
+      }
+    }
+
+    // 头：贴图向后展开（倒置时方向相反）
+    if (H && H.w > 0) {
+      const hpx = hh * scale;
+      _drawEnt(H, x, upside ? Y(hBottom) : Y(hBottom) - hpx, wpx, hpx, false, flipNotes);
+    } else if (_showDefaultOn()) {
+      const hpx = 44 * scale;
+      ctx.fillStyle = drawColor;
+      ctx.fillRect(x, upside ? Y(hBottom) : Y(hBottom) - hpx, wpx, hpx);
+    }
+
+    // 尾：位于远端外侧，纹理垂直翻转（"倒扣"）
+    if (T && T.w > 0) {
+      const tpx = th * scale;
+      _drawEnt(T, x, upside ? Y(tEdge) : Y(tEdge) - tpx, wpx, tpx, false, !flipNotes);
+    } else if (_showDefaultOn()) {
+      const tpx = Math.max(2, 4 * scale);
+      ctx.fillStyle = drawColor;
+      ctx.fillRect(x, upside ? Y(tEdge) : Y(tEdge) - tpx, wpx, tpx);
+    }
+  };
+
+  // ── 裁剪到游戏画面框：音符只允许在游玩区域内下落 ──
+  // 画面比例拟合后，画布上下会留出信箱边（游戏画面框外）。若不裁剪，音符贴图会
+  // 在其前沿（unit 0 = 画面框上沿）之上最多溢出一个贴图高，看起来像在游玩区域外下落。
+  // 纵向限 480 unit（Y(0)~Y(480)，天然兼容倒置），横向限舞台列区。
+  const clipT = Math.min(Y(0), Y(480));
+  const clipB = Math.max(Y(0), Y(480));
+  const clipL = X(cols[0][0]);
+  const clipR = X(cols[cols.length - 1][1]);
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(clipL, clipT, clipR - clipL, clipB - clipT);
+  ctx.clip();
+
+  const winS = t - leadMs * 0.2;
+  const winE = t + leadMs;
   const si = bisectLeft(hitIndex.starts, winS, "t");
   const ei = bisectLeft(hitIndex.starts, winE, "t");
-
-  // 收集可视对象
-  const notes = [];   // {i, isLn, o}
   for (let k = si; k < ei; k++) {
-    const s = hitIndex.starts[k];
-    const o = objs[s.idx];
+    const o = objs[hitIndex.starts[k].idx];
     const i = Math.floor(o.x * keys / 512);
     if (i < 0 || i >= keys) continue;
-    const isLn = !!(o.type & 128);
-    notes.push({ i, isLn, o });
-  }
-
-  // LN 按住状态：头已到判定线且未结束 → 按住；结束后沿尾巴保持按键一段
-  const lnHeld = new Array(keys).fill(false);
-
-  // ---- 打击反馈：普通音符到判定线记一次打击 ----
-  for (const n of notes) {
-    if (n.isLn) continue;
-    if (n.o.time <= t && n.o.time >= t - PLAY_HIT_FLASH) colHit[n.i] = Math.max(colHit[n.i], n.o.time);
-  }
-  // LN 头到达判定线 → 按住；尾端滑过判定线 → 记释放时刻，按键保持一段
-  for (const ln of hitIndex.lnEnds) {
-    if (ln.t > t) break;
-    const o = objs[ln.idx];
-    const i = Math.floor(o.x * keys / 512);
-    if (i < 0 || i >= keys) continue;
-    if (o.time <= t) {
-      if (ln.end > t) { lnHeld[i] = true; colHit[i] = Math.max(colHit[i], o.time); }
-      else { colHit[i] = Math.max(colHit[i], ln.end); } // 刚释放 → 保持按下效果
-    }
-  }
-
-  for (let i = 0; i < keys; i++) {
-    colPressed[i] = lnHeld[i] || (t - colHit[i] < PLAY_HIT_FLASH);
-  }
-
-  // ═══════════════════════ 接收器（基键 + 按下键） ═══════════════════════
-  // 始终在所有列画底键；最近打击/按住列叠加按下键（KeyImageND）。
-  for (let i = 0; i < keys; i++) {
-    const [x0, x1] = cols[i];
-    const wpx = colWpx(i);
-    const cx = cxpx(i);
-    const baseCmd = `KeyImage${i}`;
-    const pressedCmd = `KeyImage${i}D`;
-    const basePath = _resolvePath(vals.get(baseCmd), `mania-key${layout[i]}`);
-    const pressPath = _resolvePath(vals.get(pressedCmd), `mania-key${layout[i]}D`);
-    const baseEnt = basePath ? _imgEntLoaded(basePath) : null;
-    const pressEnt = pressPath ? _imgEntLoaded(pressPath) : null;
-
-    // 底键
-    let kh = 0;
-    if (baseEnt && baseEnt.h > 0) {
-      kh = keyH(baseEnt);
-      const y = upside ? Y(480) : Y(480) - kh;
-      _drawEnt(baseEnt, X(x0), y, wpx, kh, false, flipKeys);
-    }
-    // 按下键覆盖
-    if (colPressed[i] && pressEnt && pressEnt.h > 0) {
-      const kh2 = keyH(pressEnt);
-      const y = upside ? Y(480) : Y(480) - kh2;
-      _drawEnt(pressEnt, X(x0), y, wpx, kh2, false, flipKeys);
-    }
-    // 无皮肤底键 → 默认矩形（按下态加深）
-    if (!baseEnt && _showDefaultOn()) {
-      ctx.fillStyle = colPressed[i] ? "#5a5a66" : "#3a3a44";
-      ctx.strokeStyle = "#ffffff";
-      const y0 = Y(hitY), y1 = Y(480);
-      ctx.fillRect(X(x0), y0, wpx, y1 - y0);
-      ctx.strokeRect(X(x0), y0, wpx, y1 - y0);
-    }
-    // 打击灯光（mania-stage-light / lightingN·L），按下列点亮
-    if (colPressed[i] && _showDefaultOn() && i >= (keys >> 1)) {
-      const lightPath = _resolvePath(vals.get("StageLight"), "mania-stage-light");
-      const lightEnt = lightPath ? _imgEntLoaded(lightPath) : null;
-      if (lightEnt) {
-        const tinted = _tintEl(lightEnt.img, _parseRgba(vals.get(`ColourLight${i + 1}`), [55, 255, 255, 255]).slice(0, 3));
-        if (tinted) {
-          const lw = wpx, lh = 30 * scale;
-          _drawEl(tinted, X(x0), Y(_num(vals.get("LightPosition"), 413)) - 15 * scale, lw, lh);
-        }
-      }
-      const isLast = i === keys - 1;
-      const lp = _resolvePath(vals.get(isLast ? "LightingL" : "LightingN"), isLast ? "lightingL" : "lightingN");
-      const lEnt = lp ? _imgEntLoaded(lp) : null;
-      if (lEnt && lEnt.w > 0) {
-        const wOv = _num_list(vals.get(isLast ? "LightingLWidth" : "LightingNWidth"), 0, keys)[i];
-        const wpx2 = wOv > 0 ? wOv * scale : wpx;
-        const hpx2 = Math.max(1, Math.round(lEnt.h * wpx2 / lEnt.w));
-        _drawEnt(lEnt, cx - wpx2 / 2, Y(hitY) - hpx2 / 2, wpx2, hpx2);
-      }
-    }
-  }
-
-  // ═══════════════════════ 音符（下落） ═══════════════════════
-  // LN 先收集（下落 + 按住），循环后统一按 身体→头→尾 绘制（参考 Beatmap_Preview_v）
-  const lnBodies = [], lnHeads = [], lnTails = [];
-  const headHFor = (i) => {
-    const parts = lnParts(i);
-    return (parts.H && parts.H.w > 0) ? Math.max(1, parts.H.h * refW / parts.H.w) : 44;
-  };
-  for (const n of notes) {
-    const { i, isLn, o } = n;
-    const [x0, x1] = cols[i];
-    const wpx = colWpx(i);
-    const drawColor = NOTE_COLORS[i % NOTE_COLORS.length];
-    if (!isLn) {
-      const bottomUnit = hitY - (o.time - t) * v;
-      // 已越过判定线则不再绘制（消失）
-      if (o.time <= t) continue;
-      if (bottomUnit < 0 || bottomUnit > hitY + 20) continue;
-      const e = normalImg(i);
+    const headEdge = posAt(o.time);
+    if (!(o.type & 128) || !(o.endTime > o.time)) {
+      if (o.time <= t) continue;            // 已越过判定线 → 消失
+      if (headEdge < 0 || headEdge > hitY + 20) continue;
+      const e = noteImg(i);
+      const wpx = colWpx(i), x = colX(i);
       if (e && e.w > 0) {
-        const nh = Math.max(1, Math.round(e.h * refW / e.w * scale));
-        const y = upside ? Y(bottomUnit) : Y(bottomUnit) - nh;
-        _drawEnt(e, X(x0), y, wpx, nh, false, flipNotes);
+        const nh = unitH(e) * scale;
+        _drawEnt(e, x, upside ? Y(headEdge) : Y(headEdge) - nh, wpx, nh, false, flipNotes);
       } else if (_showDefaultOn()) {
         const nh = 44 * scale;
-        const yTop = upside ? Y(bottomUnit) : Y(bottomUnit) - nh;
-        ctx.fillStyle = drawColor;
-        ctx.fillRect(X(x0), yTop, wpx, nh);
+        ctx.fillStyle = NOTE_COLORS[i % NOTE_COLORS.length];
+        ctx.fillRect(x, upside ? Y(headEdge) : Y(headEdge) - nh, wpx, nh);
         ctx.fillStyle = "#ffffff";
-        ctx.fillRect(X(x0), Y(bottomUnit) - 1, wpx, Math.max(2, 2 * scale));
+        ctx.fillRect(x, Y(headEdge) - 1, wpx, Math.max(2, 2 * scale));
       }
-    } else {
-      // 下落中的 LN（头未到判定线）：记录身体/头/尾
-      const T = o.time, E = o.endTime || 0;
-      if (T > t && E > t) {
-        const headBottom = hitY - (T - t) * v;
-        const tailBottom = hitY - (E - t) * v;
-        const hhu = headHFor(i);
-        lnBodies.push({ i, yTopU: Math.max(0, tailBottom), yBotU: Math.min(hitY, headBottom - hhu / 2) });
-        lnHeads.push({ i, hb: headBottom });
-        if (tailBottom > 0) lnTails.push({ i, y: tailBottom });
+      continue;
+    }
+    // 长条：头部未到判定线 → 随下落；已到则由下方「按住」通道绘制
+    if (o.time <= t) continue;
+    const tailEdge = posAt(o.endTime);
+    if (headEdge < -4 || tailEdge > 484) continue; // 整条仍在屏幕上/下边之外
+    drawLn(i, headEdge, tailEdge, false);
+  }
+
+  // 按住中的长条（头已过判定线、尾未到）：头部钉在判定线
+  {
+    const a = bisectLeft(hitIndex.lnEnds, t - play.lnSpan, "t");
+    const b = bisectLeft(hitIndex.lnEnds, t, "t");
+    for (let k = a; k < b; k++) {
+      const ln = hitIndex.lnEnds[k];
+      if (ln.end <= t) continue;
+      const o = objs[ln.idx];
+      const i = Math.floor(o.x * keys / 512);
+      if (i < 0 || i >= keys) continue;
+      drawLn(i, hitY, posAt(ln.end), true);
+    }
+  }
+  ctx.restore(); // 结束音符裁剪
+
+  // 按键默认绘制在音符之上（官方 KeyArea 位于 Column 子级末尾，晚于 HitObjectArea），
+  // 但仍低于舞台（Stage）的判定图与最顶层（TopLevel）的打击爆炸。
+  if (!keysUnder) drawKeys();
+
+  // ═══════════════════════ 打击反馈：判定图 + 打击爆炸 ═══════════════════════
+  if (ev && ev.n) {
+    const explEnt = pickImg(vals.get("LightingN"), "lightingN");
+    const nWidths = _num_list(vals.get("LightingNWidth"), 0, keys);
+    const scorePosU = _num(vals.get("ScorePosition"), 300);
+    const span = Math.max(PLAY_EXPLODE_IN + PLAY_EXPLODE_OUT, PLAY_JUDGE_TOTAL);
+    const a = bisectLeft(ev.t, t - span);
+    const b = bisectLeft(ev.t, t);
+
+    // 判定图（mania-hit* / hit*，官方 LegacyManiaJudgementPiece）：
+    // 官方 Stage.OnNewResult 先 judgements.Clear 再 Add，同一时刻只显示最新一次判定
+    if (b > a) {
+      const k = b - 1;
+      // 判定图水平位置：官方每个 Stage 各有一个判定容器（Top/BottomCentre 锚点），
+      // 固定在所属舞台水平中央；分离舞台且 SeparateScore=1 时取命中所属舞台的中心
+      const stageCols = split && !_boolFalse(vals.get("SeparateScore"))
+        ? (ev.i[k] >= half ? [half, cols.length - 1] : [0, half - 1])
+        : [0, cols.length - 1];
+      const judgeCx = X((cols[stageCols[0]][0] + cols[stageCols[1]][1]) / 2);
+      const dt = t - ev.t[k];
+      if (dt < PLAY_JUDGE_TOTAL) {
+        const res = ev.r[k];
+        const files = HIT_LOOKUP[res];
+        const iniPath = HIT_INI_KEYS[res] ? vals.get(HIT_INI_KEYS[res]) : null;
+        let jEnt = null;
+        if (files) {
+          for (const base of files) { jEnt = pickImg(iniPath, base); if (jEnt) break; }
+        }
+        if (jEnt && jEnt.w > 0) {
+          const sc = _playJudgeScale(dt);
+          const h = (jEnt.h / 1.6) * scale * sc;
+          const w = Math.max(1, jEnt.w * h / jEnt.h);
+          ctx.save();
+          ctx.globalAlpha = Math.max(0, Math.min(1, _playJudgeAlpha(dt)));
+          ctx.drawImage(jEnt.img, judgeCx - w / 2, Y(scorePosU) - h / 2, w, h);
+          ctx.restore();
+        }
+      }
+    }
+
+    // 打击爆炸（LightingN / ExplosionImage，官方 LegacyHitExplosion：Additive，按列显示）
+    if (explEnt && explEnt.w > 0) {
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      for (let k = a; k < b; k++) {
+        const dt = t - ev.t[k];
+        if (dt < 0 || dt >= PLAY_EXPLODE_IN + PLAY_EXPLODE_OUT) continue;
+        const i = ev.i[k];
+        const ew = (nWidths[i] > 0 ? nWidths[i] : (cols[i][1] - cols[i][0])) * scale;
+        const eh = Math.max(1, explEnt.h * ew / explEnt.w);
+        ctx.globalAlpha = Math.max(0, Math.min(1, _playExplodeAlpha(dt)));
+        ctx.drawImage(explEnt.img, cxpx(i) - ew / 2, Y(hitY) - eh / 2, ew, eh);
+      }
+      ctx.restore();
+    }
+  }
+}
+
+/** 动态预览 HUD：血条 / 分数 / 准确率 / 连击（数值随时间推进）。 */
+function _drawPlayHud(sx, sy, screenW, scale, X, Y, vals, cols) {
+  const ctx = _p.ctx;
+  const ev = _p.play.events;
+  const t = _playTimeMs();
+  const stat = ev && ev.n ? _playStatsAt(ev, t) : { combo: 0, score: 0, acc: 100 };
+  const stageLeft = cols[0][0], stageRight = cols[cols.length - 1][1];
+
+  _drawScorebar(X(stageRight), sy + 480 * scale, scale);
+
+  const scorePrefix = _fontPrefix("ScorePrefix", "score");
+  const comboPrefix = _fontPrefix("ComboPrefix", "combo");
+  const scoreImg = _imgEntLoaded(_digitPath(scorePrefix, "1"));
+  const scoreH = (scoreImg ? scoreImg.h : 26) / 1.6 * scale;
+  const scoreOverlap = _num(state.ini.get("Fonts", "ScoreOverlap"), 0) / 1.6 * scale;
+  const hudRight = 14 / 1.6 * scale;
+  _drawNumber(String(stat.score).padStart(8, "0"), scorePrefix,
+    sx + screenW - hudRight, sy + 10 / 1.6 * scale, "right", scoreH, scoreOverlap, "score-0");
+  _drawNumber(`${stat.acc.toFixed(2)}%`, scorePrefix,
+    sx + screenW - hudRight, sy + 45 / 1.6 * scale, "right", scoreH * 0.6, scoreOverlap);
+
+  // 连击计数（场地水平居中，ComboPosition 为数字中心 Y；0 连不显示）
+  const comboY = _num(vals.get("ComboPosition"), 111);
+  const comboImg = _imgEntLoaded(_digitPath(comboPrefix, "1"));
+  const comboH = (comboImg ? comboImg.h : 44) / 1.6 * scale;
+  const comboOverlap = _num(state.ini.get("Fonts", "ComboOverlap"), 0) / 1.6 * scale;
+  const comboCx = X((stageLeft + stageRight) / 2);
+  const comboCy = Y(comboY);
+
+  // 断连（官方 LegacyManiaComboCounter.updateCount(rolling: combo==0)）：
+  // popOutCountText 用 ColourBreak（默认红）着色，alpha 立即 0.8 后 200ms 淡出到 0，
+  // 同时 scale 1 → 4；被断掉的连击数由 displayedCountText 在 diff×20ms 内滚动到 0（alpha 0.5）。
+  const cb = _parseRgba(vals.get("ColourBreak"), [255, 0, 0, 255]);
+  const brkIdx = ev && ev.breaks ? bisectLeft(ev.breaks, t, "t") : 0;
+  const brk = ev && ev.breaks && brkIdx > 0 ? ev.breaks[brkIdx - 1] : null;
+  if (brk) {
+    const dt = t - brk.t;
+    if (cb[3] > 0 && dt < 200) {
+      const p = dt / 200;
+      const h = comboH * (1 + 3 * p);
+      ctx.globalAlpha = Math.max(0, 0.8 * (1 - p));
+      _drawNumber(String(brk.combo), comboPrefix, comboCx, comboCy - h / 2, "center", h, comboOverlap, null, cb.slice(0, 3));
+      ctx.globalAlpha = 1;
+    }
+    const rollDur = brk.combo * 20;
+    if (stat.combo === 0 && dt < rollDur) {
+      const roll = Math.round(brk.combo * (1 - dt / rollDur));
+      if (roll > 0) {
+        ctx.globalAlpha = 0.5;
+        _drawNumber(String(roll), comboPrefix, comboCx, comboCy - comboH / 2, "center", comboH, comboOverlap);
+        ctx.globalAlpha = 1;
       }
     }
   }
-  // 按住中的 LN（头已到判定线、尾未到）：参考项目 lnEnds pass，
-  // 头钉在判定线、身体从判定线中部延伸到尾端
-  for (const ln of hitIndex.lnEnds) {
-    if (ln.t > t) break;
-    if (ln.end <= t) continue; // 只有尾部下落到判定线后整条才消失
-    const o = objs[ln.idx];
-    const i = Math.floor(o.x * keys / 512);
-    if (i < 0 || i >= keys) continue;
-    const tailBottom = hitY - (ln.end - t) * v;
-    const hhu = headHFor(i);
-    lnBodies.push({ i, yTopU: Math.max(0, tailBottom), yBotU: hitY - hhu / 2 });
-    lnHeads.push({ i, hb: hitY });
-    if (tailBottom > 0) lnTails.push({ i, y: tailBottom });
-  }
-  // ── LN 身体 ──
-  for (const b of lnBodies) {
-    const { i, yTopU, yBotU } = b;
-    if (yTopU >= yBotU) continue;
-    const [x0] = cols[i];
-    const wpx = colWpx(i);
-    const parts = lnParts(i);
-    const pixTop = Y(yTopU), pixBot = Y(yBotU);
-    const tpix = Math.min(pixTop, pixBot), bpix = Math.max(pixTop, pixBot);
-    if (parts.L && parts.L.w > 0) {
-      const tileH = Math.max(1, wpx * parts.L.h / parts.L.w);
-      // 从头部端向上平铺到尾部端（像素坐标，兼容 upside）
-      for (let yy = bpix - tileH; yy < tpix + tileH; yy += tileH) {
-        const tp = Math.max(yy, tpix);
-        const bt = Math.min(yy + tileH, bpix);
-        if (bt <= tp) continue;
-        const srcY = (tp - yy) / tileH * parts.L.h;
-        const srcH = (bt - tp) / tileH * parts.L.h;
-        ctx.drawImage(parts.L.img, 0, srcY, parts.L.w, srcH, X(x0), tp, wpx, bt - tp);
-      }
-    } else if (_showDefaultOn()) {
-      // 兜底：同色半透明条
-      ctx.fillStyle = "rgba(150,180,220,0.35)";
-      ctx.fillRect(X(x0), tpix, wpx, bpix - tpix);
-    }
-  }
-  // ── LN 头（钉在判定线或随下落） ──
-  for (const h of lnHeads) {
-    const { i, hb } = h;
-    const [x0] = cols[i];
-    const wpx = colWpx(i);
-    const parts = lnParts(i);
-    const drawColor = NOTE_COLORS[i % NOTE_COLORS.length];
-    if (parts.H && parts.H.w > 0) {
-      const hh = Math.max(1, headHFor(i) * scale);
-      const hy = upside ? Y(hb) : Y(hb) - hh;
-      _drawEnt(parts.H, X(x0), hy, wpx, hh, false, flipNotes);
-    } else if (_showDefaultOn()) {
-      const hh = 44 * scale;
-      const hy = upside ? Y(hb) : Y(hb) - hh;
-      ctx.fillStyle = drawColor;
-      ctx.fillRect(X(x0), hy, wpx, hh);
-    }
-  }
-  // ── LN 尾（尾图或细横线，在尾部端） ──
-  for (const tl of lnTails) {
-    const { i, y } = tl;
-    const [x0] = cols[i];
-    const wpx = colWpx(i);
-    const parts = lnParts(i);
-    const drawColor = NOTE_COLORS[i % NOTE_COLORS.length];
-    if (parts.T && parts.T.w > 0) {
-      const th = Math.max(1, Math.round(parts.T.h * refW / parts.T.w * scale));
-      const ty = Y(Math.max(0, y)) - th / 2;
-      _drawEnt(parts.T, X(x0), ty, wpx, th, false, flipNotes);
-    } else if (_showDefaultOn()) {
-      const th = Math.max(2, 4 * scale);
-      ctx.fillStyle = drawColor;
-      ctx.fillRect(X(x0), Y(Math.max(0, y)) - th / 2, wpx, th);
-    }
+
+  if (stat.combo > 0) {
+    _drawNumber(String(stat.combo), comboPrefix,
+      comboCx, comboCy - comboH / 2, "center", comboH, comboOverlap, "combo-0");
   }
 }
 
@@ -1129,7 +1638,7 @@ function _drawPlayNotes(P) {
 
 function _draw(ctx, cw, ch) {
   const page = _pv("page", "游玩界面");
-  const play = !!(_p.play && _p.play.bm) && page === "对局预览";
+  const play = !!(_p.play && _p.play.bm) && page === "动态预览";
   const playKeys = play ? Math.max(1, Math.min(18, _p.play.keys)) : null;
   const vals = _collectValues(playKeys);
   const keys = playKeys || Math.max(1, Math.min(18, parseInt(_num(vals.get("Keys"), 4), 10) || 4));
@@ -1160,7 +1669,19 @@ function _draw(ctx, cw, ch) {
   const keysUnder = _bool(vals.get("KeysUnderNotes"));
   const split = _bool(vals.get("SplitStages")) && keys > 1;
   const stageSep = _num(vals.get("StageSeparation"), 40);
-  const noteBodyStyle = parseInt(_choice(vals.get("NoteBodyStyle"), 1), 10) || 0;
+  // NoteBodyStyle（osu!stable / wiki 语义，见 _holdBodyAnchors）：
+  // 0=Stretch、1=Cascade from top（默认）、2=Cascade from bottom；
+  // stable 枚举另含 3=RepeatBottom、4=RepeatTopAndBottom。
+  // 官方 LegacySkin：skin.ini 显式设置的值始终生效，与 [General] Version 无关；
+  // Version 只决定「未设置时」的默认值（< 2.5 → Stretch），故分两种情形处理。
+  const bodyStyleRaw = vals.get("NoteBodyStyle");
+  const bodyStyleVal = bodyStyleRaw == null ? null : _choice(bodyStyleRaw, 1);
+  const noteBodyStyle =
+    bodyStyleVal == null
+      ? (_skinVersion() >= 2.5 ? 1 : 0)
+      : bodyStyleVal >= 0 && bodyStyleVal <= 4
+        ? bodyStyleVal
+        : 0;
   const noteRefW = _num(vals.get("WidthForNoteHeightScale"), 0);
   const cbStyle = parseInt(_choice(vals.get("ComboBurstStyle"), 1), 10) || 0;
 
@@ -1199,10 +1720,12 @@ function _draw(ctx, cw, ch) {
   const judgeLine = _parseRgba(vals.get("ColourJudgementLine"), [255, 255, 255, 255]);
   const judgeLineColor = rgb_to_hex(judgeLine.slice(0, 3));
 
-  // 屏幕背景：优先皮肤 menu-background / menu-bg（等比覆盖铺满、居中裁掉溢出），否则纯黑
+  // 屏幕背景：动态预览用谱面自带背景（官方游玩界面显示歌曲背景），
+  // 其余页面用皮肤 menu-background / menu-bg（等比覆盖铺满、居中裁掉溢出），否则纯黑
   let bgPath = null;
   if (_pv("bg", true)) {
-    bgPath = _mgrPath("menu-background") || _mgrPath("menu-bg");
+    if (play && _p.play && _p.play.bgPath) bgPath = _p.play.bgPath;
+    else bgPath = _mgrPath("menu-background") || _mgrPath("menu-bg");
   }
   const bgEnt = bgPath ? _imgEntLoaded(bgPath) : null;
   if (bgEnt && bgEnt.w > 0 && bgEnt.h > 0) {
@@ -1229,13 +1752,15 @@ function _draw(ctx, cw, ch) {
     return;
   }
 
-  // 列底
+  // 列底（倒置时 Y(0) 在画面框底部，取两端较小者为上沿，否则会画到画面框外）
+  const fieldTop = Math.min(Y(0), Y(480));
+  const fieldH = Math.abs(Y(480) - Y(0));
   for (let i = 0; i < cols.length; i++) {
     const [x0, x1] = cols[i];
     const rgba = _parseRgba(vals.get(`Colour${i + 1}`), [0, 0, 0, 255]);
     const fill = rgba[3] > 0 ? rgb_to_hex(rgba.slice(0, 3)) : "#1c1c22";
     ctx.fillStyle = fill;
-    ctx.fillRect(X(x0), Y(0), (x1 - x0) * scale, 480 * scale);
+    ctx.fillRect(X(x0), fieldTop, (x1 - x0) * scale, fieldH);
   }
 
   // 血条（屏幕级 HUD）：移至舞台装饰之后绘制，避免被舞台底部/左右边框遮挡，
@@ -1254,29 +1779,49 @@ function _draw(ctx, cw, ch) {
     ctx.stroke();
   }
 
-  // 小节线（barline）：预览展示在舞台中部 y=240
+  // 小节线（barline）：官方 LegacyBarLine 用 Height = BarlineHeight ?? 1.2、Colour = ColourBarline ?? 白，
+  // RelativeSizeAxes = X（每列各一条），位置即该小节时刻的滚动位置（随谱面下落）。
+  // 动态预览按谱面小节时刻滚动；其余页面保留舞台中部 y=240 的静态示意线。
   const barlineRgba = _parseRgba(vals.get("ColourBarline"), [255, 255, 255, 255]);
   const barlineH = Math.max(0, _num(vals.get("BarlineHeight"), 1.2)) * scale;
-  if (barlineRgba[3] <= 0) {
-    ctx.strokeStyle = "#888888";
-    ctx.lineWidth = 1;
-    ctx.setLineDash([4, 4]);
-    ctx.beginPath();
-    ctx.moveTo(X(stageLeft), Y(240));
-    ctx.lineTo(X(stageRight), Y(240));
-    ctx.stroke();
-    ctx.setLineDash([]);
-  } else if (barlineH > 0) {
-    ctx.strokeStyle = rgb_to_hex(barlineRgba.slice(0, 3));
-    ctx.lineWidth = Math.max(1, Math.round(barlineH));
-    ctx.beginPath();
-    ctx.moveTo(X(stageLeft), Y(240));
-    ctx.lineTo(X(stageRight), Y(240));
-    ctx.stroke();
+  const drawBarLine = (u) => {
+    const y = Y(u);
+    if (barlineRgba[3] <= 0) {
+      ctx.strokeStyle = "#888888";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+    } else if (barlineH > 0) {
+      ctx.strokeStyle = rgb_to_hex(barlineRgba.slice(0, 3));
+      ctx.lineWidth = Math.max(1, Math.round(barlineH));
+    } else {
+      return;
+    }
+    for (let i = 0; i < cols.length; i++) {
+      ctx.beginPath();
+      ctx.moveTo(X(cols[i][0]), y);
+      ctx.lineTo(X(cols[i][1]), y);
+      ctx.stroke();
+    }
+    if (barlineRgba[3] <= 0) ctx.setLineDash([]);
+  };
+  const bmLines = play && _p.play.bm ? _p.play.bm.barLines : null;
+  if (bmLines && bmLines.length) {
+    const tNow = _playTimeMs();
+    const vBar = _playScrollVel();
+    for (const bl of bmLines) {
+      const u = hitY - (bl.t - tNow) * vBar;
+      if (u < -4 || u > 484) continue;
+      drawBarLine(u);
+    }
+  } else {
+    drawBarLine(240);
   }
 
-  // 舞台灯光（按压状态列 i >= keys//2，颜色按 ColourLight 着色）
+  // 舞台灯光（静态预览演示：右半列模拟按下，颜色按 ColourLight 着色）
+  // 动态预览由 _drawPlayNotes 按真实按键状态绘制，故此处只在非动态预览时绘制，
+  // 否则动态预览的右半列会一直亮着这层“假灯光”。
   // 按需求纳入“显示默认组件”开关：关闭则隐藏按压灯光效果
+  if (!play) {
   const lightPath = _resolvePath(vals.get("StageLight"), "mania-stage-light");
   if (lightPath && _showDefaultOn()) {
     const lightEnt = _imgEntLoaded(lightPath);
@@ -1292,6 +1837,7 @@ function _draw(ctx, cw, ch) {
         _pick("mania-stage-light", X(x0), Y(lightY) - 15 * scale, lw, lh);
       }
     }
+  }
   }
 
   // 按键/接收器：宽度拉伸到轨道宽度、高度保持图片原逻辑高度（÷1.6）
@@ -1320,8 +1866,55 @@ function _draw(ctx, cw, ch) {
     }
   };
 
+  // 判定线（mania-stage-hint；分离模式每个舞台各画一条）
+  // 官方层级：命中检测器属于 HitObjectArea.hitTarget，位于 UnderlayElements 之后、
+  // 音符 content 之前 → 音符会盖住判定线，而按键（KeyArea）盖住判定线。
+  // 故动态预览在音符之前调用；静态预览仍在音符之后绘制（便于查看/点选演示音符下的判定线）。
+  // 选中信息单独收集，最后统一登记，避免打乱「绘制顺序 = 可点选层级」的约定。
+  const hintPath = _resolvePath(vals.get("StageHint"), "mania-stage-hint");
+  const stageRanges = split
+    ? [[cols[0][0], cols[half - 1][1]], [cols[half][0], cols[cols.length - 1][1]]]
+    : [[stageLeft, stageRight]];
+  const hintPicks = [];
+  const drawHitTarget = () => {
+    for (const [sl, sr] of stageRanges) {
+      const sw = sr - sl;
+      const hEnt = hintPath ? _imgEntLoaded(hintPath) : null;
+      if (hEnt && hEnt.w > 0) {
+        // 判定线高度按图片宽高比缩放，但 1x1 占位图会把高度撑成与宽度等大
+        // （th = sw*scale 的巨大方形），既影响观感也导致框选范围/高亮框错误。
+        // 故限制高度不超过一个合理上限（按舞台宽的 20%，通常判定线远细于此）。
+        const th = Math.max(1, Math.min(
+          Math.round(hEnt.h * sw * scale / hEnt.w),
+          Math.round(sw * scale * 0.2),
+        ));
+        const cx = X((sl + sr) / 2) - sw * scale / 2;
+        const cy = Y(hitY) - th / 2;
+        _drawEnt(hEnt, cx, cy, sw * scale, th);
+        hintPicks.push({ cx, cy, w: sw * scale, h: th });
+      } else {
+        ctx.strokeStyle = judgeLineColor;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(X(sl), Y(hitY));
+        ctx.lineTo(X(sr), Y(hitY));
+        ctx.stroke();
+      }
+      // 额外的判定提示线（JudgementLine 命令）——无论 stage-hint 图片是否存在都绘制
+      // （与原项目一致：置于 if/else 之外，独立于舞台提示线）
+      if (_bool(vals.get("JudgementLine"))) {
+        ctx.strokeStyle = judgeLineColor;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(X(sl), Y(hitY));
+        ctx.lineTo(X(sr), Y(hitY));
+        ctx.stroke();
+      }
+    }
+  };
+
   if (play) {
-    _drawPlayNotes({ ctx, scale, cols, keys, vals, layout, flipKeys, flipNotes, upside, hitY, refW, noteBodyStyle, X, Y });
+    _drawPlayNotes({ ctx, scale, cols, keys, vals, layout, flipKeys, flipNotes, upside, hitY, refW, noteBodyStyle, split, X, Y, drawHitTarget });
   } else {
   if (keysUnder) drawKeys();
 
@@ -1412,17 +2005,10 @@ function _draw(ctx, cw, ch) {
     }
   }
   if (!tailCanvas && headPath) {
-    // 无尾图：用头图垂直翻转
+    // 无尾图：用头图（绘制时翻转形成"倒扣"盖子，见下方 !flipNotes）
     const hEnt = _imgEntLoaded(headPath);
     if (hEnt && hEnt.w > 0) {
-      const tmp = document.createElement("canvas");
-      tmp.width = hEnt.w;   // 1x 逻辑尺寸（canvas 无 naturalWidth）
-      tmp.height = hEnt.h;
-      const g = tmp.getContext("2d");
-      g.translate(0, tmp.height);
-      g.scale(1, -1);
-      g.drawImage(hEnt.img, 0, 0);
-      tailCanvas = tmp;
+      tailCanvas = hEnt.img;
       tailW = lnW;
       tailH = headH;
     }
@@ -1444,7 +2030,7 @@ function _draw(ctx, cw, ch) {
     if (tailCanvas) {
       const tx = X((lx0 + lx1) / 2) - tailW / 2;
       const ty = Y(lnTop) - tailH / 2;
-      _drawEl(tailCanvas, tx, ty, tailW, tailH, false, flipNotes);
+      _drawEl(tailCanvas, tx, ty, tailW, tailH, false, !flipNotes);
       _pick(`${lnPick}T`, tx, ty, tailW, tailH);
     }
   } else if (_showDefaultOn()) {
@@ -1455,47 +2041,13 @@ function _draw(ctx, cw, ch) {
   }
 
   if (!keysUnder) drawKeys();
+
+  drawHitTarget();
   } // 结束对局/静态音符分支
 
-  // 判定线（mania-stage-hint；分离模式每个舞台各画一条）
-  const hintPath = _resolvePath(vals.get("StageHint"), "mania-stage-hint");
-  const stageRanges = split
-    ? [[cols[0][0], cols[half - 1][1]], [cols[half][0], cols[cols.length - 1][1]]]
-    : [[stageLeft, stageRight]];
-  for (const [sl, sr] of stageRanges) {
-    const sw = sr - sl;
-    const hEnt = hintPath ? _imgEntLoaded(hintPath) : null;
-    if (hEnt && hEnt.w > 0) {
-      // 判定线高度按图片宽高比缩放，但 1x1 占位图会把高度撑成与宽度等大
-      // （th = sw*scale 的巨大方形），既影响观感也导致框选范围/高亮框错误。
-      // 故限制高度不超过一个合理上限（按舞台宽的 20%，通常判定线远细于此）。
-      const th = Math.max(1, Math.min(
-        Math.round(hEnt.h * sw * scale / hEnt.w),
-        Math.round(sw * scale * 0.2),
-      ));
-      const cx = X((sl + sr) / 2) - sw * scale / 2;
-      const cy = Y(hitY) - th / 2;
-      _drawEnt(hEnt, cx, cy, sw * scale, th);
-      _pick("mania-stage-hint", cx, cy, sw * scale, th);
-    } else {
-      ctx.strokeStyle = judgeLineColor;
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(X(sl), Y(hitY));
-      ctx.lineTo(X(sr), Y(hitY));
-      ctx.stroke();
-    }
-    // 额外的判定提示线（JudgementLine 命令）——无论 stage-hint 图片是否存在都绘制
-    // （与原项目一致：置于 if/else 之外，独立于舞台提示线）
-    if (_bool(vals.get("JudgementLine"))) {
-      ctx.strokeStyle = judgeLineColor;
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(X(sl), Y(hitY));
-      ctx.lineTo(X(sr), Y(hitY));
-      ctx.stroke();
-    }
-  }
+  // 判定线绘制在上面各分支内完成（动态预览在音符之前，见 drawHitTarget），
+  // 这里统一补登选中信息，保持它在点击层级里的位置与原实现一致。
+  for (const p of hintPicks) _pick("mania-stage-hint", p.cx, p.cy, p.w, p.h);
 
   // 警告箭头（WarningArrow）
   const warningPath = _resolvePath(vals.get("WarningArrow"), "mania-warningarrow");
@@ -1573,7 +2125,10 @@ function _draw(ctx, cw, ch) {
     ctx.setLineDash([]);
   }
 
-  if (!play) {
+  if (play) {
+  // ---- 动态预览 HUD：血条 / 分数 / 准确率 / 连击（随音乐推进） ----
+  _drawPlayHud(sx, sy, screenW, scale, X, Y, vals, cols);
+  } else {
   // ---- HUD：血条 / 分数 / 准确度 / 连击计数 / 判定评分 ----
   // 血条为 HUD 级元素，绘制在舞台装饰（StageForeground）之上、贴屏幕底边，
   // 锚定最右轨道右侧、向右上方延伸；倒置时不随舞台翻转。
@@ -1603,7 +2158,7 @@ function _draw(ctx, cw, ch) {
   // 判定评分 / hitburst（垂直 = ScorePosition；分离且 SeparateScore=1 时取右舞台）
   const scoreYPos = _num(vals.get("ScorePosition"), 300);
   let hbCx = stageCx;
-  if (split && _bool(vals.get("SeparateScore"))) {
+  if (split && !_boolFalse(vals.get("SeparateScore"))) {
     hbCx = X((cols[half][0] + cols[cols.length - 1][1]) / 2);
   }
   const hitValue = _pv("hit", "300g");
@@ -1670,6 +2225,20 @@ function _currentKeys() {
     if (Number.isFinite(k) && k >= 1 && k <= 18) return k;
   }
   return 4;
+}
+
+/**
+ * skin.ini 的 [General] Version（官方 LegacySkinDecoder / LegacySkinDecoder.CreateTemplateObject）：
+ * 缺省 1.0；"latest" → SkinConfiguration.LATEST_VERSION（2.7）；非法值回落 1.0。
+ * 用于 NoteBodyStyle 的生效门限（官方：该命令自 2.5 起加入，低版本忽略 → Stretch）。
+ */
+function _skinVersion() {
+  const raw = state.ini ? state.ini.get("General", "Version") : null;
+  const s = raw == null ? "" : String(raw).trim();
+  if (s === "") return 1.0;
+  if (s.toLowerCase() === "latest") return 2.7;
+  const v = parseFloat(s);
+  return Number.isFinite(v) ? v : 1.0;
 }
 
 /** 预览字段：键数跟随编辑器选择，字段取该键数对应的 [Mania] 段
@@ -1830,11 +2399,11 @@ function _buildBar() {
   bar.appendChild(sel);
   _p.pageSel = sel;
 
-  // 导入铺面（对局预览）
+  // 导入铺面（动态预览）
   const importBtn = document.createElement("button");
   importBtn.className = "btn btn-tool preview-btn-sm";
   importBtn.textContent = "导入铺面";
-  importBtn.title = "选择一张 .osu 谱面（可一并选择其音频）进行动态对局预览";
+  importBtn.title = "选择一张 .osu 谱面（可一并选择其音频）进行动态预览";
   importBtn.addEventListener("click", _importBeatmap);
   bar.appendChild(importBtn);
 
@@ -1890,7 +2459,12 @@ function _buildBar() {
   });
   bar.appendChild(refreshBtn);
 
-  // 对局预览控制行（首页面选未匹配时隐藏）
+  return bar;
+}
+
+/** 构建动态预览控制行（歌曲名 / 播放 / 进度条 / 下落速度）。
+ * 由 renderPreview 按设置 play_bar_pos 放到工具栏内（画布上方）或画布下方。 */
+function _buildPlayCtl() {
   const playCtl = document.createElement("div");
   playCtl.className = "preview-play";
   playCtl.hidden = true;
@@ -1900,8 +2474,10 @@ function _buildBar() {
     <input type="range" class="preview-progress" min="0" max="1" step="1" value="0">
     <span class="preview-play-time">0:00 / 0:00</span>
     <label class="preview-speed"><span>下落速度</span>
-      <select class="text-input field-select preview-speed-sel"></select>
+      <input type="range" class="preview-speed-sel" min="${PLAY_SPEED_MIN}" max="${PLAY_SPEED_MAX}" step="1">
+      <span class="preview-speed-val"></span>
     </label>
+    <button class="btn btn-tool preview-btn-sm preview-fs-btn" title="全屏播放（F11）">⛶ 全屏</button>
   `;
   const t = _p.play || _playReset();
   t.ctl = playCtl;
@@ -1910,19 +2486,16 @@ function _buildBar() {
   t.progress = playCtl.querySelector(".preview-progress");
   t.timeLbl = playCtl.querySelector(".preview-play-time");
   t.speedSel = playCtl.querySelector(".preview-speed-sel");
-  for (let s = PLAY_SPEED_MIN; s <= PLAY_SPEED_MAX; s++) {
-    const o = document.createElement("option");
-    o.value = String(s);
-    o.textContent = s;
-    t.speedSel.appendChild(o);
-  }
+  t.speedVal = playCtl.querySelector(".preview-speed-val");
+  t.fsBtn = playCtl.querySelector(".preview-fs-btn");
   t.speedSel.value = String(t.speed);
+  t.speedVal.textContent = String(t.speed);
   t.playBtn.addEventListener("click", () => _playToggle());
   t.progress.addEventListener("input", () => { if (t.progress.value !== "") _playSeek(Number(t.progress.value)); });
-  t.speedSel.addEventListener("change", () => _playSetSpeed(t.speedSel.value));
-  bar.appendChild(playCtl);
-
-  return bar;
+  t.speedSel.addEventListener("input", () => _playSetSpeed(t.speedSel.value));
+  t.speedSel.addEventListener("change", () => persistSettings()); // 松手时把下落速度写进设置
+  t.fsBtn.addEventListener("click", () => _togglePlayFullscreen());
+  return playCtl;
 }
 
 /** 页面切换统一处理：状态、调度、控制行显隐、对局循环启停。 */
@@ -1930,10 +2503,10 @@ function _onPageChange(page) {
   state.preview.page = page;
   _commitPreview();
   emit("preview:page-changed");
-  const playMode = page === "对局预览";
+  const playMode = page === "动态预览";
   const p = _p.play;
-  // 控制行：只要导入过铺面就显示（进度条/下落速度随时可调），无铺面才隐藏
-  if (p && p.ctl) p.ctl.hidden = !p.bm;
+  // 控制行（歌曲名 / 播放 / 进度条 / 下落速度）：仅动态预览且有谱面时显示
+  if (p && p.ctl) p.ctl.hidden = !(playMode && p.bm);
   if (playMode && p && p.bm) {
     _schedulePlayLoop();
   } else if (!playMode) {
@@ -1943,7 +2516,7 @@ function _onPageChange(page) {
   _scheduleDraw();
 }
 
-/** 切到对局预览（导入成功后调用）。 */
+/** 切到动态预览（导入成功后调用）。 */
 function _playSwitchTo(page) {
   if (_p.pageSel) _p.pageSel.value = page;
   _onPageChange(page);
@@ -1958,13 +2531,73 @@ function _syncBar() {
   }
 }
 
-/** 恢复对局预览控制行显隐（画布重渲染后调用）；有铺面才显示。 */
+/** 恢复动态预览控制行显隐（画布重渲染后调用）；仅动态预览且有谱面时显示。 */
 function _syncPlayCtl() {
   const p = _p.play;
   if (!p || !p.ctl) return;
-  p.ctl.hidden = !p.bm;
-  const onPlay = _pv("page", "游玩界面") === "对局预览" && !!p.bm;
+  const onPlay = _pv("page", "游玩界面") === "动态预览" && !!p.bm;
+  p.ctl.hidden = !onPlay;
   if (onPlay && !p.raf) _schedulePlayLoop();
+  // 离开动态预览（或谱面被清空）时自动退出全屏播放：否则工具栏被隐藏、无退出入口
+  if (!onPlay && _p.fullscreen) _setPlayFullscreen(false);
+}
+
+/** 把控制行放到设置 play_bar_pos 指定的位置（工具栏内 / 画布下方）。
+ * 设置变更时也可直接调用，无需重建整个预览。 */
+function _applyPlayBarPos() {
+  const p = _p.play;
+  if (!p || !p.ctl) return;
+  const target = state.settings.play_bar_pos === "bottom" ? _p.host : _p.bar;
+  if (target && p.ctl.parentElement !== target) target.appendChild(p.ctl);
+}
+
+// ---------------------------------------------------------------------------
+// 全屏播放（F11 快捷键 / 控制行按钮）：窗口原生全屏 + 隐藏工具栏与右侧面板
+// ---------------------------------------------------------------------------
+
+/** 参与全屏的元素（浏览器调试环境退回 DOM 全屏时使用）。 */
+function _fsTarget() {
+  return _p.host || document.getElementById("preview-pane");
+}
+
+/** 仅动态预览（有谱面、控制行可见）时允许进入全屏播放，避免无退出按钮。 */
+function _canFullscreen() {
+  const p = _p.play;
+  return !!p && !!p.ctl && !p.ctl.hidden;
+}
+
+/** 同步全屏播放的界面状态：body class + 按钮文案。 */
+function _syncFullscreenUi() {
+  document.body.classList.toggle("play-fullscreen", !!_p.fullscreen);
+  const b = _p.play && _p.play.fsBtn;
+  if (b) {
+    b.textContent = _p.fullscreen ? "⛶ 退出全屏" : "⛶ 全屏";
+    b.title = _p.fullscreen ? "退出全屏播放（F11）" : "全屏播放（F11）";
+  }
+}
+
+async function _setPlayFullscreen(on) {
+  if (on === _p.fullscreen) return;
+  _p.fullscreen = on;
+  _p.fsDom = false;
+  const handled = await setWindowFullscreen(on);
+  if (!handled) {
+    // 非 Tauri 环境（浏览器调试）：退回 DOM 全屏
+    try {
+      if (on) { await _fsTarget().requestFullscreen(); _p.fsDom = true; }
+      else if (document.fullscreenElement) await document.exitFullscreen();
+    } catch (e) {
+      _p.fullscreen = false;
+      _syncFullscreenUi();
+      return toast("无法切换全屏：" + (e.message || e), "error");
+    }
+  }
+  _syncFullscreenUi();
+  _resize(); // 全屏切换后可用尺寸变化，立即重算一次画布
+}
+
+function _togglePlayFullscreen() {
+  return _setPlayFullscreen(!_p.fullscreen);
 }
 
 function _openShowDialog() {
@@ -2069,6 +2702,8 @@ function _openValueDialog() {
 
 /** 渲染预览区：控制栏 + 画布。 */
 export function renderPreview() {
+  // 兼容旧设置：页面「对局预览」已更名为「动态预览」，否则旧 settings.json 的旧值会与下拉失配
+  if (state.preview.page === "对局预览") state.preview.page = "动态预览";
   const host = document.getElementById("preview-pane");
   host.innerHTML = "";
   host.className = "preview-host";
@@ -2083,12 +2718,17 @@ export function renderPreview() {
   wrap.appendChild(canvas);
   host.appendChild(wrap);
 
+  // 动态预览控制行（歌曲名 / 播放 / 进度条 / 下落速度），位置由设置 play_bar_pos 决定
+  _buildPlayCtl();
+
   _p.bar = bar;
   _p.wrap = wrap;
+  _p.host = host;
   _p.canvas = canvas;
   _p.ctx = canvas.getContext("2d");
   _p.aspectSel = bar.querySelector(".preview-aspect");
   _syncBar();
+  _applyPlayBarPos();
   _syncPlayCtl();
 
   canvas.addEventListener("click", _onCanvasClick);
@@ -2101,6 +2741,28 @@ export function renderPreview() {
 
   _resize();
 
+  // 全屏播放：F11 快捷键（只绑定一次，renderPreview 会因换皮肤等原因重复调用）
+  if (!_p.fsKeysBound) {
+    _p.fsKeysBound = true;
+    window.addEventListener("keydown", (e) => {
+      if (e.key !== "F11") return;
+      e.preventDefault(); // 阻止 WebView2 默认行为，统一走我们的全屏播放
+      if (_p.fullscreen || _canFullscreen()) _togglePlayFullscreen();
+    });
+    // 浏览器调试环境退回 DOM 全屏时，用户按 Esc 退出 → 同步界面状态
+    document.addEventListener("fullscreenchange", () => {
+      if (!_p.fsDom || document.fullscreenElement) return;
+      _p.fsDom = false;
+      _p.fullscreen = false;
+      _syncFullscreenUi();
+      _resize();
+    });
+  }
+  _syncFullscreenUi();
+
+  // 恢复上次载入的谱面（已有谱面时不重复导入，避免换皮肤/重扫时重置播放进度）
+  if (state.settings.last_beatmap && !(_p.play && _p.play.bm)) _restoreLastBeatmap();
+
   // 数据联动
   on("skin:reloaded", () => {
     // 文件清单可能变化（重扫描/覆盖素材）：清空图片缓存并回收 Blob URL，重新加载
@@ -2108,6 +2770,10 @@ export function renderPreview() {
       if (ent && ent.url) URL.revokeObjectURL(ent.url);
     }
     _p.imgCache.clear();
+    // 派生缓存均引用旧 Image 对象，必须一并清空，否则素材被覆盖后仍显示旧合成图
+    _p.tintCache.clear();
+    _p.animCache.clear();
+    _p.holdCache.clear();
     _scheduleDraw();
   });
   on("skin:opened", () => {
@@ -2116,16 +2782,24 @@ export function renderPreview() {
       if (ent && ent.url) URL.revokeObjectURL(ent.url);
     }
     _p.imgCache.clear();
+    _p.tintCache.clear();
+    _p.animCache.clear();
+    _p.holdCache.clear();
     _scheduleDraw();
   });
   on("ini:changed", _scheduleDraw);
-  on("settings:changed", _scheduleDraw);
+  on("settings:changed", () => { _applyPlayBarPos(); _syncJudgeEvents(); _scheduleDraw(); });
   on("preview:element-selected", () => { /* 元素面板会自行处理 */ });
 }
 
 /** 触发预览重绘（防抖）。 */
 export function refreshPreview() {
   _scheduleDraw();
+}
+
+/** 退出全屏播放（若处于全屏）；供关窗前调用，避免把全屏尺寸写进窗口状态。 */
+export async function exitPlayFullscreen() {
+  if (_p.fullscreen) await _setPlayFullscreen(false);
 }
 
 /** 挂载预览控制栏（兼容旧调用；控制栏在 renderPreview 中已构建）。 */

@@ -60,6 +60,23 @@ export async function onWindowCloseRequested(fn) {
   }
 }
 
+/**
+ * 切换窗口原生全屏（全屏播放用）。
+ * @param {boolean} on
+ * @returns {Promise<boolean>} 是否由后端处理；false 表示当前非 Tauri 环境，调用方可退回 DOM 全屏
+ */
+export async function setWindowFullscreen(on) {
+  const w = winApi();
+  if (!w) return false;
+  try {
+    await w.getCurrentWindow().setFullscreen(!!on);
+    return true;
+  } catch (e) {
+    console.warn("切换窗口全屏失败", e);
+    return false;
+  }
+}
+
 /** 将本地绝对路径转成 tauri:// 可加载的 URL（用于 <img src> 预览）。 */
 export function assetUrl(path) {
   const c = core();
