@@ -282,15 +282,12 @@ export function refreshPanel() {
   if (summary) summary.textContent = `共 ${s.total} 个元素 | 已有 ${s.present} | 缺失 ${s.missing}`;
 
   // 分类过滤（设置项 enable_category）：按当前预览界面筛选
+  // 页面 → 界面名统一由 PAGE_SCREEN 提供（动态游玩预览与静态游玩预览同为"游玩"）；
+  // 无映射的页面（未在 PAGE_SCREEN 中登记）不过滤，显示全部。
   let screenMatch = null;
   if (state.settings.enable_category) {
-    const pageName = state.preview.page;
-    if (pageName === "游玩界面") {
-      screenMatch = (e) => e.screens.includes("游玩") || e.screens.includes("通用");
-    } else {
-      const target = PAGE_SCREEN[pageName];
-      if (target != null) screenMatch = (e) => e.screens.includes("通用") || e.screens.includes(target);
-    }
+    const target = PAGE_SCREEN[state.preview.page];
+    if (target != null) screenMatch = (e) => e.screens.includes("通用") || e.screens.includes(target);
   }
 
   const openState = state.expanded;

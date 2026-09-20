@@ -39,11 +39,16 @@ export function parseOsuBeatmap(content) {
 
   // Difficulty
   let cs = 4;
+  let drainRate = 5; // DrainRate = 编辑器里的 HP，官方 mania 血量增减按它计算
   (sections["Difficulty"] || []).forEach((line) => {
     const i = line.indexOf(":");
     if (i < 0) return;
-    if (line.slice(0, i).trim() === "CircleSize") {
+    const key = line.slice(0, i).trim();
+    if (key === "CircleSize") {
       cs = Math.round(parseFloat(line.slice(i + 1).trim())) || 4;
+    } else if (key === "DrainRate") {
+      const v = parseFloat(line.slice(i + 1).trim());
+      if (Number.isFinite(v)) drainRate = Math.min(10, Math.max(0, v));
     }
   });
 
@@ -102,7 +107,7 @@ export function parseOsuBeatmap(content) {
   const bpm = utp ? 60000 / utp.beatLength : 0;
 
   return {
-    mode, circleSize: cs, previewTime, audioFilename, backgroundFilename,
+    mode, circleSize: cs, drainRate, previewTime, audioFilename, backgroundFilename,
     title: meta.Title || meta.TitleUnicode || "未命名",
     artist: meta.Artist || meta.ArtistUnicode || "未知",
     creator: meta.Creator || "", version: meta.Version || "",

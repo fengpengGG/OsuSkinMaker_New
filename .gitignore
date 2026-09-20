@@ -20,5 +20,7 @@ temp/
 .DS_Store
 
 /src-tauri/gen/
-备忘录.txt
-史山修复.md
+备忘录.md
+待办.md
+版本迭代.md
+已修复.md

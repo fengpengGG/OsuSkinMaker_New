@@ -1,6 +1,6 @@
 [package]
 name = "OsuSkinMaker"
-version = "0.1.5"
+version = "0.1.7-beta"
 description = "osu! 皮肤制作工具（Tauri v2）"
 edition = "2021"
 

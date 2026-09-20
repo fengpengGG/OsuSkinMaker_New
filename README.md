@@ -1,8 +1,10 @@
-# OsuSkinMaker v0.1.5 beta (Tauri)
+# OsuSkinMaker v0.1.7 beta (Tauri)
 
 一个集 **游玩预览**、**动态预览（对局预览）**、**元素管理**、**skin.ini 编辑**于一体的 osu! mania 皮肤制作 GUI 工具。
 
 ⚠️ **使用的话要备份皮肤文件，备份，备份，备份！！！**
+
+> **更新版本时请把压缩包里的所有文件都替换，不要只替换 exe。**
 
 <img width="2047" height="1097" alt="image" src="https://github.com/user-attachments/assets/691d8a48-98d2-4be3-a350-bbe5f8e1baf2" />
 
@@ -505,6 +507,6 @@ src-tauri/src/commands.rs（list_images / find_file_by_name / read_text / read_f
 - 仍是「一个很糙的 AI 生成的小玩意」，优化可能不是很好，还有一堆神秘 bug
 - 只做了 mania 相关的 skin.ini 编辑与游玩预览；对其他模式不太了解
 - 选歌界面/成绩结算预览的摆放较难，尚未完善
-- 动态预览（导入铺面实时下落）为 v0.1.5 beta 新增，判定是模拟出来的，只用于看皮肤观感
+- 动态预览（导入铺面实时下落）为 v0.1.7 beta 新增，判定是模拟出来的，只用于看皮肤观感
 - 只做了 stable 表现；lazer 模式切换尚未实现
 - 如发现问题或有什么建议，欢迎提出，非常感谢

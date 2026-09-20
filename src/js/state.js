@@ -34,6 +34,9 @@ const VALID = {
 // 动态预览判定结果顺序（权重表按此顺序取值；与官方 mania 判定档位一致）
 export const JUDGE_KEYS = ["300g", "300", "200", "100", "50", "miss"];
 
+// 动态预览可选的播放倍速（整条时间轴与音乐同步变速；1 = 原速）
+export const PLAY_RATES = [0.5, 0.75, 1, 1.25, 1.5, 2];
+
 const DEFAULT_SETTINGS = {
   theme: "dark",
   hd_default: "ask",
@@ -47,12 +50,14 @@ const DEFAULT_SETTINGS = {
   // 预览选中图层高亮框：是否显示 + 颜色（rgba 字符串）
   hitbox_show: true,
   hitbox_color: "rgba(64, 200, 255, 0.9)",
-  // 动态预览控制行（歌曲名 / 播放 / 进度条 / 下落速度）位置："top" 画布上方（默认）| "bottom" 画布下方
+  // 动态预览控制行（歌曲名 / 播放 / 进度条 / 倍速 / 下落速度）位置："top" 画布上方（默认）| "bottom" 画布下方
   play_bar_pos: "top",
   // 动态预览判定权重（相对值，内部按总和归一）：默认 300g 为主 + 少量 miss 以演示断连
   judge_weights: { "300g": 640, "300": 220, "200": 70, "100": 40, "50": 20, miss: 10 },
   // 动态预览下落速度（官方 ScrollSpeed 1~40，越大越快）与上次载入的谱面（.osu 路径，启动自动恢复）
   play_speed: 25,
+  // 动态预览播放倍速（整条时间轴与音乐同步变速，1 = 原速）
+  play_rate: 1,
   last_beatmap: "",
   // 窗口状态（与原项目字段一致）：无记录时默认最大化
   window_state: "zoomed",  // "zoomed" | "normal"
@@ -75,7 +80,7 @@ export const state = {
 
   // 预览状态（持久化，与 Python 版 preview_* 字段对应）
   preview: {
-    page: "游玩界面",
+    page: "静态游玩预览",
     bg: true,
     cb: true,
     warning: true,
@@ -122,6 +127,8 @@ function _sanitize(settings) {
   // 下落速度（1~40 取整）与上次谱面路径
   const _sp = Number(out.play_speed);
   out.play_speed = Number.isFinite(_sp) ? Math.min(40, Math.max(1, Math.round(_sp))) : DEFAULT_SETTINGS.play_speed;
+  // 播放倍速：只接受预设档位，非法值回落到原速
+  out.play_rate = PLAY_RATES.includes(Number(out.play_rate)) ? Number(out.play_rate) : DEFAULT_SETTINGS.play_rate;
   if (typeof out.last_beatmap !== "string") out.last_beatmap = DEFAULT_SETTINGS.last_beatmap;
   if (typeof out.preview !== "object" || !out.preview) out.preview = { ...state.preview };
   else out.preview = { ...state.preview, ...out.preview };

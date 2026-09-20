@@ -4,7 +4,7 @@
 // 面板以 ColumnStart 从左侧绝对定位，因此 mania 演奏面板整体偏左。
 // 皮肤图片经后端 base64（loadImageSrc）加载，@2x 按官方规则减半为 1x 逻辑尺寸。
 
-import { state, on, emit, persistSettings, rescanSkin, JUDGE_KEYS } from "./state.js";
+import { state, on, emit, persistSettings, rescanSkin, JUDGE_KEYS, PLAY_RATES } from "./state.js";
 import { loadImageSrc, invoke, setWindowFullscreen } from "./api.js";
 import { SkinManager } from "./manager.js";
 import { NOTE_LAYOUT, findManiaSection } from "./skin_ini.js";
@@ -64,7 +64,7 @@ const FAIL_BUTTONS = [
 
 const MAGIC_SCALE = 1.6; // x768(SD) → x480 预览换算
 
-const PAGES = ["游玩界面", "动态预览", "暂停界面", "失败界面", "成绩结算界面", "选歌界面"];
+const PAGES = ["静态游玩预览", "动态游玩预览", "暂停界面", "失败界面", "成绩结算界面", "选歌界面"];
 
 // 动态预览滚动参数（官方 DrawableManiaRuleset）：
 //   ComputeScrollTime(speed) = MAX_TIME_RANGE / speed（MAX_TIME_RANGE = 11485，speed 1~40）
@@ -77,12 +77,75 @@ const PLAY_KEY_RELEASE_DELAY = 80; // 官方 LegacyKeyArea：松开后 Delay(80)
 const PLAY_LIGHT_OUT = 250;     // 官方 LegacyColumnBackground：松开后 250ms 淡出并纵向压扁
 const PLAY_SPEED_MIN = 1, PLAY_SPEED_MAX = 40;
 const PLAY_LIGHT_FPS_DEFAULT = 60; // 官方 LightFramePerSecond 默认 60（解码器把 ≤0 归为 24）
+// 旧版皮肤动画默认帧长（官方 LegacySkinExtensions.SIXTY_FRAME_TIME = 1000 / 60）：
+// 音符 / 长条头尾等未显式指定帧长的动画都按此帧率播放。
+const PLAY_ANIM_60FPS_MS = 1000 / 60;
+// 音符 / 长条动画的计时原点偏移（官方 DrawableHitObject.UpdateState：
+// AnimationStartTime = HitObject.StartTime - InitialLifetimeOffset，mania 未覆写
+// InitialLifetimeOffset → 取 DrawableHitObject 默认值 10000ms）。
+const PLAY_ANIM_LIFETIME_OFFSET = 10000;
+// 打击爆炸动画总时长（官方 LegacyHitExplosion / LegacyBodyPiece：
+// frameLength = max(1000/60, 170 / 帧数)，即整段动画约 170ms 播完）
+const PLAY_ANIM_EXPLODE_SPAN = 170;
+// 判定图动画帧长（官方 ManiaLegacySkinTransformer.getResult：frameLength = 1000 / 20）
+const PLAY_ANIM_JUDGE_MS = 1000 / 20;
+// 判定线贴图（mania-stage-hint）的纵向缩放：官方 LegacyHitTarget 的 Sprite 设
+// Scale = (1, 0.9 × 1.6025)，且 RelativeSizeAxes = X（宽度拉伸到舞台宽，不按比例）。
+// 0.9 × 1.6025 是 768 空间下的系数，换算到 480 空间再 ÷1.6。
+const PLAY_HINT_SCALE_Y = 0.9 * 1.6025 / 1.6; // ≈ 0.9014
+// 判定提示线（JudgementLine）对应的 Box：Height = 1（768 空间 → 480 空间 ÷1.6），
+// Alpha = 0.9（官方 LegacyHitTarget），且竖直方向与提示线贴图中心对齐。
+const PLAY_JUDGE_LINE_H = 1 / 1.6;
+const PLAY_JUDGE_LINE_ALPHA = 0.9;
+// 列分隔线宽度缩放：官方 LegacyStageBackground 的列线 Container 设 Scale = (0.740, 1)
+// （只压横向宽度，纵向仍铺满）。
+const PLAY_COL_LINE_SCALE = 0.740;
+// 连击数字跳动（官方 LegacyManiaComboCounter.onCountIncrement）：
+// 每次连击 +1 时瞬时 ScaleTo(1, 1.4)，再 300ms Out 缓动回 (1, 1)（横向不变，纵向拉伸）。
+const PLAY_COMBO_PUNCH_MS = 300;
+const PLAY_COMBO_PUNCH_SCALE_Y = 1.4;
+
+// HUD 分数 / 准确率滚动（官方 RollingCounter.TransformCount）：
+// 目标值变化时从「当前显示值」在固定时长内按 Easing.OutQuad 缓动到新值，
+// 中途再次变化则打断上一次动画、从打断瞬间的显示值重新起步。
+// LegacyScoreCounter：RollingDuration 1000 / Easing.Out；
+// LegacyAccuracyCounter（PercentageCounter）：RollingDuration 375 / Easing.OutQuad。
+const PLAY_ROLL_SCORE_MS = 1000;
+const PLAY_ROLL_ACC_MS = 375;
+
+// 分数 / 准确率的等宽步进（官方 LegacySpriteText.FixedWidth，
+// LegacyScoreCounter 与 LegacyAccuracyCounter 均设为 true）：
+// 数字一律按参考字符 '5' 的宽度步进，',' '.' '%' 例外（仍用自身宽度）。
+// 步进固定后整串宽度不随数值变化，数值滚动时不会左右伸缩。
+const PLAY_FIXED_WIDTH_REF = "5";
+const PLAY_FIXED_WIDTH_EXCLUDE = ",.%";
+
+// 血条（官方 LegacyHealthDisplay / HealthDisplay / ManiaHealthProcessor）：
+//   - 初始满血；mania 无自然掉血，只在判定时增减（Meh/Miss 掉血，其余回血，clamp 到 [0,1]）
+//   - 显示血量 Current 启动时从 0 起每 150ms +0.05 填充到当前血量（约 3s），此后直接跟随血量
+//   - fill 宽度对 Current × 满宽逐帧做 200ms OutQuint 平滑（官方 Interpolation.ValueAt）
+//   - 血量上升时 marker.Bulge()：瞬时 1.2，再 150ms 线性回落到 0.8
+//   - 命中判定（非 miss）与启动填充的每一步触发 Flash：explode 精灵 120ms 内 1 → 1.6
+//     （血量 ≥ 0.5 时 1 → 2）并同步淡出，血量 ≥ 0.5 时改用 Additive 混合
+const PLAY_HP_EPIC = 0.5;
+const PLAY_HP_SMOOTH_MS = 200;
+const PLAY_HP_INIT_STEP = 0.05;
+const PLAY_HP_INIT_MS = 150;
+const PLAY_HP_BULGE_PEAK = 1.2;
+const PLAY_HP_BULGE_END = 0.8;
+const PLAY_HP_BULGE_MS = 150;
+const PLAY_HP_FLASH_MS = 120;
 
 // 打击反馈时长（官方 LegacyHitExplosion：FadeIn 80 + FadeOut 120）
 const PLAY_EXPLODE_IN = 80, PLAY_EXPLODE_OUT = 120;
 // 判定图时长（官方 LegacyManiaJudgementPiece：FadeIn 20 + Delay 160 + FadeOut 40）
 const PLAY_JUDGE_IN = 20, PLAY_JUDGE_HOLD = 160, PLAY_JUDGE_OUT = 40;
 const PLAY_JUDGE_TOTAL = PLAY_JUDGE_IN + PLAY_JUDGE_HOLD + PLAY_JUDGE_OUT;
+// 判定图 miss 曲线（官方 LegacyManiaJudgementPiece.PlayAnimation 的 Miss 分支）：
+// ScaleTo(1.2) 瞬时后 100ms Out 回到 1；RotateTo(0) 后 100ms Out 转到随机 ±5.73°
+const PLAY_JUDGE_MISS_SCALE = 1.2;
+const PLAY_JUDGE_MISS_MS = 100;
+const PLAY_JUDGE_MISS_ROT = 5.73;
 
 // ---------------------------------------------------------------------------
 // 模块内部状态
@@ -235,22 +298,6 @@ function _tintEl(el, rgb) {
   return c;
 }
 
-/** 把图片逆时针旋转 90°，返回新的 canvas。
- * 注意：Canvas 的 rotate(θ) 在屏幕坐标（y 向下）中为顺时针，因此
- * 逆时针 90° 需用 rotate(-Math.PI/2) + translate(0, c.height)，
- * 与 PIL 的 Image.Transpose.ROTATE_90（逆时针）及官方 stable 一致。
- */
-function _rot90(el) {
-  const c = document.createElement("canvas");
-  c.width = el.naturalHeight || el.height;
-  c.height = el.naturalWidth || el.width;
-  const g = c.getContext("2d");
-  g.translate(0, c.height);
-  g.rotate(-Math.PI / 2);
-  g.drawImage(el, 0, 0);
-  return c;
-}
-
 // ---------------------------------------------------------------------------
 // 皮肤文件解析辅助（与 Python 版一致）
 // ---------------------------------------------------------------------------
@@ -334,6 +381,40 @@ function _animPaths(iniValue, base) {
   return out;
 }
 
+/**
+ * 依次尝试若干候选名，返回第一个存在的动画帧序列（官方 GetAnimation 的回退链：
+ * ini 指定名 → 默认名，各自先试 -N 序列帧再回退单张）。
+ */
+function _animPathsAny(iniValue, ...bases) {
+  for (const base of bases) {
+    const paths = _animPaths(iniValue, base);
+    if (paths.length) return paths;
+  }
+  return [];
+}
+
+/**
+ * 从动画帧序列取当前帧（官方 osu.Framework Animation 语义）：
+ * 每帧 frameLen 毫秒，elapsed 为动画已播放时长；loop = false 时播完停在末帧。
+ * 单帧素材（非动画）恒返回该帧。
+ */
+function _animEnt(paths, elapsed, frameLen, loop) {
+  if (!paths || !paths.length) return null;
+  if (paths.length === 1) return _imgEntLoaded(paths[0]);
+  const n = paths.length;
+  const i = Math.floor(Math.max(0, elapsed) / Math.max(1, frameLen));
+  return _imgEntLoaded(paths[loop ? ((i % n) + n) % n : Math.min(i, n - 1)]);
+}
+
+/**
+ * [General] AnimationFramerate 决定的帧长（官方 LegacySkinExtensions.getFrameLength）：
+ * 值 > 0 → 1000 / 值；否则（缺省 -1）视为「1 秒播完所有帧」→ 1000 / 帧数。
+ */
+function _animConfigFrameLen(paths) {
+  const rate = _num(state.ini ? state.ini.get("General", "AnimationFramerate") : null, 0);
+  return rate > 0 ? 1000 / rate : 1000 / Math.max(1, paths.length);
+}
+
 function _parseRgba(text, defaultArr = [0, 0, 0, 255]) {
   const parts = text ? String(text).split(",").map((s) => s.trim()) : [];
   if (parts.length < 3) return defaultArr;
@@ -343,6 +424,14 @@ function _parseRgba(text, defaultArr = [0, 0, 0, 255]) {
   };
   const a = parts.length >= 4 ? num(parts[3], defaultArr[3]) : defaultArr[3];
   return [num(parts[0], defaultArr[0]), num(parts[1], defaultArr[1]), num(parts[2], defaultArr[2]), a];
+}
+
+/** 官方 LegacyColourCompatibility.ApplyWithDoubledAlpha：
+ * Alpha 属性与 Colour.A 相乘（Colour 经 DisallowZeroAlpha），故最终 alpha = (A/255)²；
+ * A = 0 时 Alpha 为 0，完全不可见。 */
+function _doubledAlpha(rgba) {
+  const a = (rgba && rgba[3] ? rgba[3] : 0) / 255;
+  return a * a;
 }
 
 /** 读取 [Fonts] 数字前缀字段，区分"缺省"与"留空"（官方语义）：
@@ -392,64 +481,180 @@ function _pick(filename, x, y, w, h) {
 }
 
 /** 用皮肤数字图渲染一串字符；prefix 为 null（字段留空）时整体不绘制。
- * tint（[r,g,b]）非空时对数字图做乘法着色（官方 Drawable.Colour 语义）。 */
-function _drawNumber(text, prefix, cx, cy, anchor, digitH, overlap, pickTag, tint) {
+ * tint（[r,g,b]）非空时对数字图做乘法着色（官方 Drawable.Colour 语义）。
+ * scaleY（默认 1）为纵向缩放（官方 ScaleTo 的非等比缩放语义）：横向按图片宽高比、
+ * 纵向拉伸，且围绕数字框的竖直中心伸缩（官方 Origin = Centre）。
+ * fixedW 为真时启用等宽步进（官方 LegacySpriteText.FixedWidth）：数字按参考字符
+ * 的宽度推进，图仍按自身宽高比绘制。 */
+function _drawNumber(text, prefix, cx, cy, anchor, digitH, overlap, pickTag, tint, scaleY = 1, fixedW = false) {
   if (prefix == null) return;
   const ctx = _p.ctx;
+  const dh = digitH * scaleY;
+  const dy = cy + (digitH - dh) / 2;
+  const fallbackW = Math.max(digitH * 0.6, 1);
+  let refW = 0;
+  if (fixedW) {
+    const rp = _digitPath(prefix, PLAY_FIXED_WIDTH_REF);
+    const re = rp ? _imgEntLoaded(rp) : null;
+    refW = re && re.h > 0 ? re.w * digitH / re.h : fallbackW;
+  }
   const items = [];
   for (const ch of String(text)) {
     const path = _digitPath(prefix, ch);
     const ent = path ? _imgEntLoaded(path) : null;
-    let w = 0;
-    if (ent && ent.h > 0) {
-      w = ent.w * digitH / ent.h;
-    } else {
-      w = Math.max(digitH * 0.6, 1);
-    }
-    items.push({ ch, ent, w });
+    const w = ent && ent.h > 0 ? ent.w * digitH / ent.h : fallbackW;
+    items.push({ ch, ent, w, adv: fixedW && !PLAY_FIXED_WIDTH_EXCLUDE.includes(ch) ? refW : w });
   }
   const n = items.length;
-  const totalW = items.reduce((s, it) => s + it.w, 0) - overlap * (n - 1);
+  const totalW = items.reduce((s, it) => s + it.adv, 0) - overlap * (n - 1);
   let x = cx;
   if (anchor === "center") x = cx - totalW / 2;
   else if (anchor === "right") x = cx - totalW;
   for (const it of items) {
     if (it.ent) {
       const src = tint ? _tintEl(it.ent.img, tint) : null;
-      _drawEl(src || it.ent.img, x, cy, it.w, digitH);
+      _drawEl(src || it.ent.img, x, dy, it.w, dh);
     } else {
       ctx.save();
       ctx.fillStyle = tint ? `rgb(${tint[0]},${tint[1]},${tint[2]})` : "#ffffff";
-      ctx.font = `bold ${Math.max(digitH * 0.8, 8)}px "Microsoft YaHei UI"`;
+      ctx.font = `bold ${Math.max(dh * 0.8, 8)}px "Microsoft YaHei UI"`;
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      ctx.fillText(it.ch, x + it.w / 2, cy + digitH / 2);
+      ctx.fillText(it.ch, x + it.w / 2, dy + dh / 2);
       ctx.restore();
     }
-    x += it.w - overlap;
+    x += it.adv - overlap;
   }
-  if (pickTag) _pick(pickTag, anchor === "right" ? cx - totalW : cx - (anchor === "center" ? totalW / 2 : 0), cy, totalW, digitH);
+  if (pickTag) _pick(pickTag, anchor === "right" ? cx - totalW : cx - (anchor === "center" ? totalW / 2 : 0), dy, totalW, dh);
 }
 
-/** 绘制 osu!mania 血条（引擎硬编码规则：bg+colour 整体逆时针旋转 90°、缩放 0.7、÷1.6）。 */
-function _drawScorebar(rightX, bottomY, scale) {
+/** 官方 LegacyHealthDisplay.getFillColour：血量越低 fill / marker 越暗，低于 0.2 后转红。
+ * 插值走 LegacyUtils.InterpolateNonLinear（sRGB 空间线性，默认 Easing.None）。 */
+function _scorebarFillColour(hp) {
+  const BLACK = [0, 0, 0], WHITE = [255, 255, 255], RED = [255, 0, 0];
+  const mix = (a, b, k) => [
+    Math.round(a[0] + (b[0] - a[0]) * k),
+    Math.round(a[1] + (b[1] - a[1]) * k),
+    Math.round(a[2] + (b[2] - a[2]) * k),
+  ];
+  if (hp < 0.2) return mix(BLACK, RED, Math.min(1, (0.2 - hp) / 0.2));
+  if (hp < PLAY_HP_EPIC) return mix(WHITE, BLACK, Math.min(1, (PLAY_HP_EPIC - hp) / PLAY_HP_EPIC));
+  return WHITE;
+}
+
+/** marker 缩放（官方 LegacyMarker.Bulge）：瞬时 1.2，再 150ms 线性回落到 0.8。
+ * bulgeAt 为 Infinity（尚未发生过 Bulge）时返回 1。 */
+function _scorebarBulge(bulgeAt, t) {
+  const dt = t - bulgeAt;
+  if (!(dt >= 0)) return 1;
+  if (dt >= PLAY_HP_BULGE_MS) return PLAY_HP_BULGE_END;
+  return PLAY_HP_BULGE_PEAK + (PLAY_HP_BULGE_END - PLAY_HP_BULGE_PEAK) * (dt / PLAY_HP_BULGE_MS);
+}
+
+/**
+ * 血条逐帧状态（对应官方 HealthDisplay.Update + LegacyHealthDisplay.Update）：
+ *   cur      = HealthDisplay.Current（显示血量；启动时从 0 逐步填充，之后直接跟随血量）
+ *   w        = LegacyHealthDisplay.fill.Width（对 cur × 满宽做 200ms OutQuint 平滑）
+ *   bulgeAt  = 最近一次 marker.Bulge() 的时刻（血量上升超过 0.001 时触发）
+ *   flashAt  = 最近一次 Flash() 的时刻（命中判定 / 启动填充每步）
+ * 状态以谱面时间 t 驱动：暂停 / 拖动进度条时动画随之冻结，与官方一致。
+ */
+function _scorebarStep(stat, ev, t, maxW) {
+  const p = _p.play;
+  let sb = p.sb;
+  if (!sb) {
+    // seek 后 HUD 并未重新加载 → 不重播启动填充动画，直接对齐当前血量
+    const snap = !!p.sbSnap;
+    p.sbSnap = false;
+    sb = p.sb = {
+      t, k: stat.k, hp0: stat.hp, step: 0,
+      init: !snap, initAt: t, cur: snap ? stat.hp : 0,
+      lastCur: snap ? stat.hp : 0,
+      w: snap ? null : 0, // null = 首帧直接对齐目标宽度
+      bulgeAt: Infinity, flashAt: Infinity,
+    };
+  }
+  // 官方 Math.Clamp(Clock.ElapsedFrameTime, 0, 200)
+  const dt = Math.max(0, Math.min(t - sb.t, PLAY_HP_SMOOTH_MS));
+  sb.t = t;
+
+  // 1) 启动填充动画（官方 HealthDisplay.startInitialAnimation）：
+  //    每 150ms 把 Current 抬高 0.05，并在该 150ms 内线性走过去（TransformBindableTo）；
+  //    一旦 health 变化（首个判定到来）立即结束动画。
+  if (sb.init) {
+    if (stat.hp !== sb.hp0) {
+      sb.init = false;
+      sb.cur = stat.hp;
+    } else {
+      const e = Math.max(0, t - sb.initAt) / PLAY_HP_INIT_MS;
+      const full = Math.floor(e), frac = e - full;
+      sb.cur = full >= 1 ? Math.min(PLAY_HP_INIT_STEP * (full - 1 + frac), stat.hp) : 0;
+      if (full !== sb.step) {
+        sb.step = full;
+        if (full >= 1) sb.flashAt = t; // 官方每步 Scheduler.AddOnce(Flash)
+      }
+      if (full >= 1 && Math.min(PLAY_HP_INIT_STEP * full, stat.hp) >= stat.hp) {
+        sb.init = false;
+        sb.cur = stat.hp;
+      }
+    }
+  } else {
+    sb.cur = stat.hp; // 官方 Update：Current.Value = health.Value
+  }
+
+  // 2) fill 宽度平滑（官方 Interpolation.ValueAt(…, 0, 200, Easing.OutQuint)）
+  const targetW = sb.cur * maxW;
+  if (sb.w == null) {
+    sb.w = targetW;
+  } else if (dt > 0) {
+    const k = Math.min(1, dt / PLAY_HP_SMOOTH_MS);
+    sb.w += (targetW - sb.w) * (1 - Math.pow(1 - k, 5));
+  }
+
+  // 3) HealthChanged：显示血量变化超过 0.001 且上升时 Bulge
+  if (Math.abs(sb.cur - sb.lastCur) > 0.001) {
+    if (sb.cur > sb.lastCur) sb.bulgeAt = t;
+    sb.lastCur = sb.cur;
+  }
+
+  // 4) 新判定触发 Flash（官方 onNewJudgement：IsHit 才闪，miss 不闪）
+  if (stat.k !== sb.k) {
+    if (stat.k > sb.k) {
+      for (let j = sb.k; j < stat.k; j++) {
+        if (ev.r[j] !== "miss") { sb.flashAt = t; break; }
+      }
+    }
+    sb.k = stat.k;
+  }
+  return sb;
+}
+
+/**
+ * 绘制 osu!mania 血条（引擎硬编码规则：bg / fill / marker 整体逆时针旋转 90°、
+ * 缩放 0.7、÷1.6 后贴场地右下角，见 LegacyHealthDisplay）。
+ * 血量动画对齐官方 HealthDisplay + LegacyHealthDisplay（见 _scorebarStep）；
+ * 静态预览不传 stat / ev，按满血不播动画绘制。
+ */
+function _drawScorebar(rightX, bottomY, scale, stat, ev, t) {
   const ctx = _p.ctx;
-  const hp = 1.0; // 预览固定满血
   const shrink = 0.7;
   const posScale = 1.6; // x768 / x480 换算因子
-
-  // 1) 锚点偏移：scorebar-marker 存在 -> (12,12)，否则 -> (5,16)
-  const hasMarker = !!_mgrPath("scorebar-marker");
-  const offX = hasMarker ? 12 : 5;
-  const offY = hasMarker ? 12 : 16;
+  const s = shrink / posScale * scale; // 1 个 768 空间单位 → 画布像素
 
   const bgEnt = _imgEntLoaded(_mgrPath("scorebar-bg"));
-  const colourEnt = _imgEntLoaded(_mgrPath("scorebar-colour"));
+  // fill 贴图为动画序列（官方 LegacyHealthDisplay：GetAnimation("scorebar-colour",
+  // true, true, startAtCurrentTime: false, applyConfigFrameRate: true)）：
+  // 帧长取自 [General] AnimationFramerate（未设置时 1 秒播完所有帧）；
+  // startAtCurrentTime = false → 动画自对局开始（t = 0）起从第 0 帧循环播放。
+  // 尺寸基准取第 0 帧（官方 fill.Width 在贴图加载时确定，不随帧变化）。
+  const colourPaths = _animPaths(null, "scorebar-colour");
+  const colourFirst = _animEnt(colourPaths, 0, 1, false);
+  const colourEnt = stat && ev ? _animEnt(colourPaths, t, _animConfigFrameLen(colourPaths), true) : colourFirst;
 
-  if (!bgEnt && !colourEnt) {
+  if (!bgEnt && !colourFirst) {
     // 兜底：示意竖条（按 0.7 缩放、x768→x480 换算后的粗略尺寸，与 Python 版一致）
-    const w = Math.max(6, Math.round(12 * scale * shrink / posScale));
-    const h = Math.max(1, Math.round(480 * scale * shrink / posScale));
+    const w = Math.max(6, Math.round(12 * s));
+    const h = Math.max(1, Math.round(480 * s));
     ctx.fillStyle = "#20202a";
     ctx.fillRect(rightX, bottomY - h, w, h);
     ctx.strokeStyle = "#4a4a55";
@@ -458,46 +663,125 @@ function _drawScorebar(rightX, bottomY, scale) {
     return;
   }
 
-  // 2) 组合图层：bg 左上角为原点，colour 带锚点偏移叠加（满血保留整张）
+  // 新式 / 旧式：有 scorebar-marker 为新式（fill 与 marker 均按血量着色），否则旧式
+  const isNew = !!_mgrPath("scorebar-marker");
+  const offX = (isNew ? 7.5 : 3) * posScale;   // fill 在容器内的偏移（LegacyFill.Position）
+  const offY = (isNew ? 7.8 : 10) * posScale;
   const bgW = bgEnt ? bgEnt.w : 757;
   const bgH = bgEnt ? bgEnt.h : 72;
-  let cw = bgW, ch = bgH;
-  if (colourEnt) {
-    cw = Math.max(cw, offX + colourEnt.w);
-    ch = Math.max(ch, offY + colourEnt.h);
-  }
-  const combo = document.createElement("canvas");
-  combo.width = Math.max(1, cw);
-  combo.height = Math.max(1, ch);
-  const g = combo.getContext("2d");
-  if (bgEnt) g.drawImage(bgEnt.img, 0, 0);
-  if (colourEnt) {
-    g.drawImage(colourEnt.img, offX, offY);
+  const fullW = colourFirst ? colourFirst.w : 0;   // maxFillWidth（fill.Width 的初始值）
+  const fullH = colourFirst ? colourFirst.h : 0;
+  const cw = Math.max(bgW, offX + fullW, 1);
+  const ch = Math.max(bgH, offY + fullH, 1);
+
+  // 静态预览（不传 stat / ev）：满血、不播动画，离屏画布跨帧复用
+  let sb;
+  if (stat && ev) {
+    sb = _scorebarStep(stat, ev, t, fullW);
   } else {
-    // 无 colour 图片：以半透明绿色示意血量
-    g.fillStyle = "rgba(76,175,80,0.75)";
-    g.fillRect(offX, offY, Math.max(1, Math.round((cw - offX) * hp)), Math.max(1, ch - offY));
+    sb = _p.sbStatic || (_p.sbStatic = { cur: 1, bulgeAt: Infinity, flashAt: Infinity });
+    sb.w = fullW;
+  }
+  const hp = sb.cur;
+  const fw = Math.max(0, Math.min(sb.w, fullW));
+
+  // 离屏画布（尺寸变化时重建）：main = 组合图层，a / b 供血量着色用
+  let buf = sb.buf;
+  if (!buf || buf.w !== cw || buf.h !== ch) {
+    const mk = () => { const c = document.createElement("canvas"); c.width = cw; c.height = ch; return c; };
+    buf = sb.buf = { w: cw, h: ch, main: mk(), a: mk(), b: mk() };
+  }
+  const g = buf.main.getContext("2d");
+  g.globalCompositeOperation = "source-over";
+  g.globalAlpha = 1;
+  g.clearRect(0, 0, cw, ch);
+  if (bgEnt) g.drawImage(bgEnt.img, 0, 0);
+
+  // marker 贴图：新式固定 scorebar-marker；旧式按血量切 ki / kidanger / kidanger2
+  let markerEnt = null;
+  if (isNew) {
+    markerEnt = _imgEntLoaded(_mgrPath("scorebar-marker"));
+  } else {
+    const base = hp < 0.2 ? "scorebar-kidanger2" : hp < PLAY_HP_EPIC ? "scorebar-kidanger" : "scorebar-ki";
+    markerEnt = _imgEntLoaded(_mgrPath(base));
   }
 
-  // 3) 整体逆时针旋转 90° + 缩放 0.7 + x768→x480 换算（再乘画布 scale）
-  const rot = _rot90(combo);
-  const outW = Math.max(1, Math.round(rot.width * shrink / posScale * scale));
-  const outH = Math.max(1, Math.round(rot.height * shrink / posScale * scale));
-  // 锚定 sw：旋转后 bg 左上角（原左侧）位于血条左下角，贴场地底边向右上方延伸
-  ctx.drawImage(rot, rightX, bottomY - outH, outW, outH);
-  _pick("scorebar-colour", rightX, bottomY - outH, outW, outH);
-  // 4) 血量标记（scorebar-marker）：同样旋转缩放后放在填充末端（满血 = 顶端）
-  if (hasMarker) {
-    const mEnt = _imgEntLoaded(_mgrPath("scorebar-marker"));
-    if (mEnt) {
-      const mrot = _rot90(mEnt.img);
-      const mw = Math.max(1, Math.round(mrot.width * shrink / posScale * scale));
-      const mh = Math.max(1, Math.round(mrot.height * shrink / posScale * scale));
-      const mcx = rightX + outW / 2;
-      const mcy = bottomY - outH; // 满血 fill_h = outH
-      ctx.drawImage(mrot, mcx - mw / 2, mcy - mh / 2, mw, mh);
-      _pick("scorebar-marker", mcx - mw / 2, mcy - mh / 2, mw, mh);
+  // 新式：fill 与 marker 一起乘算着色（官方 Drawable.Colour）；≥0.5 时为白色，无需着色
+  const tint = isNew && hp < PLAY_HP_EPIC ? _scorebarFillColour(hp) : null;
+  const layer = tint ? buf.a.getContext("2d") : g;
+  if (tint) {
+    layer.globalCompositeOperation = "source-over";
+    layer.clearRect(0, 0, cw, ch);
+  }
+
+  // fill：官方 LegacyFill 开了 Masking，按当前宽度裁剪 colour 纹理（取当前动画帧）
+  const colourDraw = colourEnt || colourFirst;
+  if (fw > 0) {
+    if (colourDraw) {
+      layer.save();
+      layer.beginPath();
+      layer.rect(offX, offY, fw, fullH);
+      layer.clip();
+      layer.drawImage(colourDraw.img, offX, offY);
+      layer.restore();
+    } else {
+      layer.fillStyle = "rgba(76,175,80,0.75)";
+      layer.fillRect(offX, offY, fw, Math.max(1, ch - offY));
     }
+  }
+
+  // marker：Origin = Centre，位置 = fill 末端（新式竖直居中，旧式贴 fill 上沿）
+  const mcx = offX + fw;
+  const mcy = offY + (isNew ? fullH / 2 : 0);
+  const bulge = _scorebarBulge(sb.bulgeAt, t);
+  if (markerEnt && markerEnt.w > 0) {
+    const mw = markerEnt.w * bulge, mh = markerEnt.h * bulge;
+    layer.drawImage(markerEnt.img, mcx - mw / 2, mcy - mh / 2, mw, mh);
+  }
+
+  if (tint) {
+    // 乘算着色：先着色整层，再用 destination-in 把透明区域还原（canvas 的 multiply
+    // 会按源 alpha 重新合成，把透明处填成 tint 色，与逐像素乘法语义不同）
+    const gb = buf.b.getContext("2d");
+    gb.globalCompositeOperation = "source-over";
+    gb.clearRect(0, 0, cw, ch);
+    gb.drawImage(buf.a, 0, 0);
+    gb.globalCompositeOperation = "multiply";
+    gb.fillStyle = `rgb(${tint[0]},${tint[1]},${tint[2]})`;
+    gb.fillRect(0, 0, cw, ch);
+    gb.globalCompositeOperation = "destination-in";
+    gb.drawImage(buf.a, 0, 0);
+    g.drawImage(buf.b, 0, 0);
+  }
+
+  // explode 精灵（官方 LegacyMarker.Flash）：不着色，命中判定与启动填充每步触发
+  const dtf = t - sb.flashAt;
+  if (markerEnt && markerEnt.w > 0 && dtf >= 0 && dtf < PLAY_HP_FLASH_MS) {
+    const k = dtf / PLAY_HP_FLASH_MS;
+    const out = 1 - Math.pow(1 - k, 2);                            // Easing.Out
+    const sc = 1 + ((hp >= PLAY_HP_EPIC ? 2 : 1.6) - 1) * out;     // ScaleTo(1).Then().ScaleTo(…, 120, Out)
+    const mw = markerEnt.w * sc, mh = markerEnt.h * sc;
+    g.save();
+    g.globalAlpha = Math.pow(1 - k, 2);                            // FadeOutFromOne(120, Out)
+    if (hp >= PLAY_HP_EPIC) g.globalCompositeOperation = "lighter"; // Blending.Additive
+    g.drawImage(markerEnt.img, mcx - mw / 2, mcy - mh / 2, mw, mh);
+    g.restore();
+  }
+
+  // 整体逆时针旋转 90°：容器 (px, py) → 画布 (rightX + py·s, bottomY - px·s)，
+  // 即 bg 左上角（px=0）落在血条底端，长度沿竖直方向向上延伸
+  ctx.save();
+  ctx.translate(rightX, bottomY);
+  ctx.scale(s, s);
+  ctx.rotate(-Math.PI / 2);
+  ctx.drawImage(buf.main, 0, 0);
+  ctx.restore();
+
+  // 命中区域（供皮肤文件定位）：血条整体 + 当前 marker
+  _pick("scorebar-colour", rightX, bottomY - cw * s, ch * s, cw * s);
+  if (markerEnt && markerEnt.w > 0) {
+    const mw = markerEnt.w * bulge * s, mh = markerEnt.h * bulge * s;
+    _pick("scorebar-marker", rightX + mcy * s - mw / 2, bottomY - mcx * s - mh / 2, mw, mh);
   }
 }
 
@@ -520,25 +804,16 @@ function _drawStageSide(path, edgeX, topY, fullH, alignRight, tag) {
   _pick(tag, x0, topY, w, fullH);
 }
 
-/** 舞台底部：不拉伸，尺寸 = 图片 1x 逻辑尺寸 × scale，锚点 Bottom。 */
+/** 舞台底部：不拉伸，尺寸 = 图片 1x 逻辑尺寸 × scale，锚点 Bottom。缺失时不画默认方块。 */
 function _drawStageBottom(path, centerX, bottomY, scale, upside, tag) {
-  const ctx = _p.ctx;
   const ent = path ? _imgEntLoaded(path) : null;
-  if (ent) {
-    const tw = Math.max(1, Math.round(ent.w * scale));
-    const th = Math.max(1, Math.round(ent.h * scale));
-    const x = centerX - tw / 2;
-    const y = upside ? bottomY : bottomY - th;
-    _drawEl(ent.img, x, y, tw, th);
-    _pick(tag, x, y, tw, th);
-    return;
-  }
-  if (!_showDefaultOn()) return;
-  const w = Math.max(10, Math.round(120 * scale));
-  const h = Math.max(10, Math.round(48 * scale));
-  ctx.fillStyle = "#3a3a44";
-  ctx.fillRect(centerX - w / 2, bottomY - h, w, h);
-  _pick(tag, centerX - w / 2, bottomY - h, w, h);
+  if (!ent) return;
+  const tw = Math.max(1, Math.round(ent.w * scale));
+  const th = Math.max(1, Math.round(ent.h * scale));
+  const x = centerX - tw / 2;
+  const y = upside ? bottomY : bottomY - th;
+  _drawEl(ent.img, x, y, tw, th);
+  _pick(tag, x, y, tw, th);
 }
 
 /**
@@ -779,11 +1054,16 @@ function _playReset() {
     latencyMs: 0,    // 输出延迟（ms）
     latencyDone: false, // 是否已探测过输出延迟（一次性）
     events: null,    // 判定事件流（见 _playBuildEvents）
+    roll: null,      // HUD 滚动计数器状态（分数 / 准确率，见 _playRoll）
+    sb: null,        // 血条动画状态（见 _scorebarStep）
+    sbSnap: false,   // 血条下次建状态时是否跳过启动填充动画（seek 用）
     judgeKey: null,  // 生成 events 时用的判定权重快照（权重变化时据此重建）
     bgPath: null,    // 谱面自带背景图（游玩时替换皮肤 bg）
     speed: state.settings.play_speed, // 下落速度（1~40，越大下落越快；随设置持久化）
+    rate: state.settings.play_rate,   // 播放倍速（整条时间轴与音乐同步变速；随设置持久化）
     // 进度条缓存（避免每帧重建）
     playBtn: null, progress: null, speedSel: null, speedVal: null, timeLbl: null, titleLbl: null, ctl: null,
+    rateSel: null,    // 播放倍速选择框
     fsBtn: null,      // 全屏播放按钮
   };
   return _p.play;
@@ -825,12 +1105,14 @@ function _playTimeMs() {
   if (a.paused || a.ended) { p.clock = null; return raw; }
 
   const now = performance.now();
+  const rate = p.rate;
   const c = p.clock;
-  // 首次、或与插值偏差过大（seek / 缓冲卡顿）→ 重新锚定
-  if (!c || Math.abs(raw - (c.raw + (now - c.at))) > 60) {
-    p.clock = { raw, at: now };
+  // 首次、倍速变化、或与插值偏差过大（seek / 缓冲卡顿）→ 重新锚定
+  if (!c || c.rate !== rate || Math.abs(raw - (c.raw + (now - c.at) * c.rate)) > 60) {
+    p.clock = { raw, at: now, rate };
   } else {
-    const smooth = c.raw + (now - c.at);
+    // 帧间按倍速外推：倍速播放时音频时间推进得更快，插值速率须同步放大
+    const smooth = c.raw + (now - c.at) * c.rate;
     return Math.max(0, Math.min(smooth, raw + 120) - _playLatencyMs());
   }
   return Math.max(0, raw - _playLatencyMs());
@@ -921,32 +1203,55 @@ function _playJudge(seed, table) {
 }
 
 /**
+ * mania 单次判定的血量变化（官方 ManiaHealthProcessor.GetHealthIncreaseFor）。
+ * DrainRate 即编辑器里的 HP；HpMultiplierNormal 需跑官方那套迭代收敛算法才能得到，
+ * 这里取 1 —— 它只作用于回血项（Meh / Miss 的掉血本来就不乘它），对 mania 影响很小。
+ * @param {string} res 判定结果（300g/300/200/100/50/miss）
+ * @param {boolean} isLn 该物件是否为长条（头/尾），miss 时长条只扣一半
+ * @param {number} dr DrainRate（0~10）
+ */
+function _playHpDelta(res, isLn, dr) {
+  switch (res) {
+    case "300g": return 0.0055 - dr * 0.0005;
+    case "300": return 0.005 - dr * 0.0005;
+    case "200": return 0.004 - dr * 0.0004;
+    case "100": return 0;
+    case "50": return -(dr + 1) * 0.0016;
+    case "miss": return -(dr + 1) * (isLn ? 0.00375 : 0.0075);
+    default: return 0;
+  }
+}
+
+/**
  * 构建判定事件流：普通音符 1 个事件；长条头/尾各 1 个（与官方一致，分别计连击）。
- * 同时预算前缀状态（连击 / 分数 / 准确率权重和），渲染时二分取用，O(log n)。
+ * 同时预算前缀状态（连击 / 分数 / 准确率权重和 / 血量），渲染时二分取用，O(log n)。
  */
 function _playBuildEvents(bm, keys) {
   const objs = bm.hitObjects;
   const jt = _judgeWeights(); // 权重表取一次，避免逐物件重复构造
+  const dr = Number.isFinite(bm.drainRate) ? bm.drainRate : 5;
   const raw = [];
   for (let k = 0; k < objs.length; k++) {
     const o = objs[k];
     const i = Math.floor(o.x * keys / 512);
     if (i < 0 || i >= keys) continue;
-    raw.push({ t: o.time, i, tail: false, r: _playJudge(k, jt) });
-    if ((o.type & 128) && o.endTime > o.time) {
-      raw.push({ t: o.endTime, i, tail: true, r: _playJudge(k + 1000003, jt) });
+    const isLn = !!(o.type & 128);
+    raw.push({ t: o.time, i, tail: false, ln: isLn, r: _playJudge(k, jt) });
+    if (isLn && o.endTime > o.time) {
+      raw.push({ t: o.endTime, i, tail: true, ln: isLn, r: _playJudge(k + 1000003, jt) });
     }
   }
   raw.sort((a, b) => a.t - b.t);
 
   const n = raw.length;
-  const t = new Array(n), i = new Array(n), r = new Array(n), tail = new Array(n);
+  const t = new Array(n), i = new Array(n), r = new Array(n), tail = new Array(n), ln = new Array(n);
   const pCombo = new Array(n + 1).fill(0);
   const pBase = new Array(n + 1).fill(0);          // currentBaseScore
   const pComboPortion = new Array(n + 1).fill(0);  // currentComboPortion
+  const pHp = new Array(n + 1).fill(1);            // 血量前缀（HealthProcessor.Health 初始 1）
   const breaks = [];                               // 断连点 {t, combo}（供连击 pop-out）
   for (let k = 0; k < n; k++) {
-    t[k] = raw[k].t; i[k] = raw[k].i; r[k] = raw[k].r; tail[k] = raw[k].tail;
+    t[k] = raw[k].t; i[k] = raw[k].i; r[k] = raw[k].r; tail[k] = raw[k].tail; ln[k] = raw[k].ln;
     const res = r[k];
     // IncreasesCombo = AffectsCombo && IsHit；miss 断连
     const combo = res === "miss" ? 0 : pCombo[k] + 1;
@@ -954,11 +1259,12 @@ function _playBuildEvents(bm, keys) {
     pCombo[k + 1] = combo;
     pBase[k + 1] = pBase[k] + (PLAY_BASE_SCORE[res] || 0);
     pComboPortion[k + 1] = pComboPortion[k] + _playComboChange(res, combo);
+    pHp[k + 1] = Math.max(0, Math.min(1, pHp[k] + _playHpDelta(res, ln[k], dr)));
   }
   // 官方：maximumComboPortion 由「全 Perfect 的自动播放」模拟得出（连击 1..n）
   let maxComboPortion = 0;
   for (let c = 1; c <= n; c++) maxComboPortion += _playComboChange("300g", c);
-  return { t, i, r, tail, pCombo, pBase, pComboPortion, maxComboPortion, n, breaks };
+  return { t, i, r, tail, ln, pCombo, pBase, pComboPortion, pHp, maxComboPortion, n, breaks };
 }
 
 /** 判定权重变化后重建事件流（权重未变则跳过，避免每次设置变更都重算）。 */
@@ -972,7 +1278,7 @@ function _syncJudgeEvents() {
 }
 
 /**
- * 当前时间下的连击 / 分数 / 准确率（官方 ManiaScoreProcessor.ComputeTotalScore）：
+ * 当前时间下的连击 / 分数 / 准确率 / 血量（官方 ManiaScoreProcessor.ComputeTotalScore）：
  *   150000 × comboProgress
  * + 850000 × Accuracy^(2 + 2×Accuracy) × accuracyProgress
  * + bonusPortion（mania 无 bonus，恒为 0）
@@ -987,7 +1293,38 @@ function _playStatsAt(ev, t) {
   const score = k > 0
     ? Math.round(150000 * comboProgress + 850000 * Math.pow(acc, 2 + 2 * acc) * accuracyProgress)
     : 0;
-  return { combo: ev.pCombo[k], score, acc: acc * 100 };
+  return { combo: ev.pCombo[k], score, acc: acc * 100, hp: ev.pHp[k], k };
+}
+
+/**
+ * 滚动计数器状态（对应官方 RollingCounter 的 DisplayedCount 变换）。
+ * 官方 RollingCounter.TransformCount 用 TransformTo 把显示值从当前值缓动到新值，
+ * 且以框架时钟为驱动——故此处同样用谱面时间 t：暂停 / 拖动进度条时动画随之冻结，
+ * 与官方暂停时动画冻结的行为一致（seek 时由调用方清空状态直接对齐）。
+ */
+function _playRollState(key) {
+  const p = _p.play;
+  p.roll = p.roll || {};
+  return p.roll[key] || (p.roll[key] = { target: null, from: 0, start: 0 });
+}
+
+/** 滚动插值：官方 RollingCounter.RollingEasing 默认 Easing.OutQuad。 */
+function _playRollAt(st, dur, t) {
+  const k = (t - st.start) / dur;
+  if (!(k > 0)) return st.from;
+  if (k >= 1) return st.target;
+  return st.from + (st.target - st.from) * (1 - Math.pow(1 - k, 2));
+}
+
+/** 目标值变化时重启动画（起点取打断瞬间的显示值），返回 t 时刻的显示值。 */
+function _playRoll(key, target, dur, t) {
+  const st = _playRollState(key);
+  if (st.target !== target) {
+    st.from = st.target == null ? target : _playRollAt(st, dur, t);
+    st.target = target;
+    st.start = t;
+  }
+  return _playRollAt(st, dur, t);
 }
 
 
@@ -1036,6 +1373,8 @@ async function _loadBeatmap(osuPath, files, restore) {
   p.manualMs = 0;
   p.last = undefined;
   p.clock = null;
+  p.sb = null;     // 新谱面从头开始 → 血条重播启动填充动画
+  p.sbSnap = false;
   p.judgeKey = null; // 判定权重可能已被修改 → 强制重建事件流
   _syncJudgeEvents();
   p.lnSpan = undefined; // 本谱面的最长长条时长（首帧惰性统计）
@@ -1057,6 +1396,7 @@ async function _loadBeatmap(osuPath, files, restore) {
         p.audioUrl = URL.createObjectURL(new Blob([bytes], { type: _audioMime(audioPath) }));
         const a = new Audio(p.audioUrl);
         a.preload = "auto";
+        a.playbackRate = p.rate; // 新音频元素需重新套用当前倍速
         a.addEventListener("ended", _playOnEnded);
         p.audio = a;
       }
@@ -1074,7 +1414,7 @@ async function _loadBeatmap(osuPath, files, restore) {
   if (!restore) {
     state.settings.last_beatmap = osuPath; // 记住谱面，下次启动自动恢复
     persistSettings();
-    _playSwitchTo("动态预览");
+    _playSwitchTo("动态游玩预览");
   }
   _schedulePlayLoop();
   return true;
@@ -1136,6 +1476,9 @@ function _playSeek(ms) {
   ms = Math.max(0, Math.min(ms, _playDurMs()));
   p.manualMs = ms;
   p.clock = null; // 跳转后重新锚定主时钟
+  p.roll = null;  // 跳转后分数/准确率直接对齐（官方 SetCountWithoutRolling：不播滚动动画）
+  p.sb = null;    // 跳转后血条直接对齐当前血量，不重播启动填充动画
+  p.sbSnap = true;
   if (p.audio) {
     try { p.audio.currentTime = ms / 1000; } catch (e) { /* ignore */ }
   }
@@ -1150,6 +1493,18 @@ function _playSetSpeed(sp) {
   state.settings.play_speed = p.speed; // 记住下落速度（松手时由 change 事件持久化）
   if (p.speedSel) p.speedSel.value = String(p.speed);
   if (p.speedVal) p.speedVal.textContent = String(p.speed);
+}
+
+function _playSetRate(rate) {
+  const p = _p.play;
+  if (!p) return;
+  // 播放倍速：整条时间轴与音乐同步变速（audio.playbackRate + 主时钟插值速率）
+  const n = Number(rate);
+  p.rate = PLAY_RATES.includes(n) ? n : 1;
+  state.settings.play_rate = p.rate; // 记住倍速（change 事件里持久化）
+  if (p.audio) p.audio.playbackRate = p.rate;
+  p.clock = null; // 倍速变化后重新锚定主时钟
+  if (p.rateSel) p.rateSel.value = String(p.rate);
 }
 
 function _schedulePlayLoop() {
@@ -1169,16 +1524,16 @@ function _stopPlayLoop() {
 function _playLoop() {
   const p = _p.play;
   if (!p || !_p.canvas) return;
-  if (_pv("page", "游玩界面") !== "动态预览") {
+  if (_pv("page", "静态游玩预览") !== "动态游玩预览") {
     p.raf = 0; // 页面已离开动态预览，停止循环
     return;
   }
 
-  // 推进时间（下落速度只影响音符线速度，音乐/时钟始终正常速度）
+  // 推进时间（下落速度只影响音符线速度；播放倍速按 rate 缩放时钟推进）
   if (p.playing) {
     const now = performance.now();
     if (p.last !== undefined) {
-      if (!p.audio) p.manualMs += now - p.last;
+      if (!p.audio) p.manualMs += (now - p.last) * p.rate;
       if (_playTimeMs() >= _playDurMs()) {
         p.playing = false;
         if (p.audio) p.audio.pause();
@@ -1216,25 +1571,47 @@ function _updatePlayUI() {
 }
 
 function _playIsActive() {
-  return !!(_p.play && _p.play.bm && _pv("page", "游玩界面") === "动态预览");
+  return !!(_p.play && _p.play.bm && _pv("page", "静态游玩预览") === "动态游玩预览");
 }
 
 // ---- 打击反馈动画曲线（官方 LegacyManiaJudgementPiece / LegacyHitExplosion）----
 
-/** 判定图不透明度：FadeIn 20 → 保持 160 → FadeOut 40。 */
+/** 判定图不透明度：FadeIn 20 (Easing.Out) → 保持 160 → FadeOut 40 (Easing.In)。 */
 function _playJudgeAlpha(dt) {
-  if (dt < PLAY_JUDGE_IN) return dt / PLAY_JUDGE_IN;
+  if (dt < PLAY_JUDGE_IN) {
+    const k = dt / PLAY_JUDGE_IN;
+    return 1 - Math.pow(1 - k, 2);        // FadeInFromZero(20, Easing.Out)
+  }
   if (dt < PLAY_JUDGE_IN + PLAY_JUDGE_HOLD) return 1;
   const k = (dt - PLAY_JUDGE_IN - PLAY_JUDGE_HOLD) / PLAY_JUDGE_OUT;
-  return k >= 1 ? 0 : 1 - k;
+  return k >= 1 ? 0 : 1 - k * k;          // FadeOutFromOne(40, Easing.In)
 }
 
-/** 判定图缩放：0.8→1(40) → 0.85 → 0.7(40) → 停 100 → 0.4(40)。 */
-function _playJudgeScale(dt) {
+/** 判定图的二次缓出进度（官方 Easing.Out），用于 miss 的缩放/旋转。 */
+function _playJudgeOut(dt) {
+  return dt >= PLAY_JUDGE_MISS_MS ? 1 : 1 - Math.pow(1 - dt / PLAY_JUDGE_MISS_MS, 2);
+}
+
+/** miss 判定图的旋转角（度）：官方 RotateTo(RNG.NextSingle(-5.73, 5.73), 100, Easing.Out)。
+ *  用事件下标做确定性伪随机，保证同一判定每帧角度一致。 */
+function _playJudgeRot(k) {
+  const h = (Math.imul(k + 7919, 2654435761) >>> 0) / 4294967296;
+  return PLAY_JUDGE_MISS_ROT * (h * 2 - 1);
+}
+
+/** 判定图缩放（官方 LegacyManiaJudgementPiece.PlayAnimation）：
+ *  miss：1.2 → 1（100ms Out）；
+ *  其余：0.8 → 1(40) → 0.85 → 0.7(40) → 停 100 → 0.4(40, In)。 */
+function _playJudgeScale(dt, res) {
+  if (res === "miss") {
+    if (dt >= PLAY_JUDGE_MISS_MS) return 1;
+    return 1 + (PLAY_JUDGE_MISS_SCALE - 1) * (1 - _playJudgeOut(dt));
+  }
   if (dt < 40) return 0.8 + 0.2 * (dt / 40);
   if (dt < 80) return 0.85 - 0.15 * ((dt - 40) / 40);
   if (dt < 180) return 0.7;
-  return Math.max(0.4, 0.7 - 0.3 * ((dt - 180) / 40));
+  const k = Math.min(1, (dt - 180) / 40);
+  return Math.max(0.4, 0.7 - 0.3 * k * k);   // ScaleTo(0.4f, 40, Easing.In)
 }
 
 /** 打击爆炸不透明度：FadeIn 80 → FadeOut 120。 */
@@ -1286,10 +1663,22 @@ function _drawPlayNotes(P) {
     return hit;
   };
   const lb = (i) => layout[i];
-  const noteImg = (i) => pickImg(vals.get(`NoteImage${i}`), `mania-note${lb(i)}`);
-  const headImg = (i) => pickImg(vals.get(`NoteImage${i}H`), `mania-note${lb(i)}H`, `mania-note${lb(i)}`);
-  const tailImg = (i) => pickImg(vals.get(`NoteImage${i}T`), `mania-note${lb(i)}T`, `mania-note${lb(i)}H`, `mania-note${lb(i)}`);
-  const bodyImg = (i) => pickImg(vals.get(`NoteImage${i}L`), `mania-note${lb(i)}L`);
+  // 音符贴图为动画序列（官方 LegacyNotePiece：GetAnimation(name, ClampToEdge, ClampToEdge,
+  // true, true)）→ 帧长 SIXTY_FRAME_TIME、循环播放，计时原点见 PLAY_ANIM_LIFETIME_OFFSET
+  // （下落中的音符 elapsed 为正，动画持续推进）
+  const animMemo = new Map();
+  const pickAnim = (elapsed, ini, ...bases) => {
+    const key = `${ini || ""}|${bases.join("|")}`;
+    let paths = animMemo.get(key);
+    if (paths === undefined) { paths = _animPathsAny(ini, ...bases); animMemo.set(key, paths); }
+    return _animEnt(paths, elapsed, PLAY_ANIM_60FPS_MS, true);
+  };
+  const animClock = (startTime) => t - startTime + PLAY_ANIM_LIFETIME_OFFSET;
+  const noteImg = (i, o) => pickAnim(animClock(o.time), vals.get(`NoteImage${i}`), `mania-note${lb(i)}`);
+  const headImg = (i, o) => pickAnim(animClock(o.time), vals.get(`NoteImage${i}H`), `mania-note${lb(i)}H`, `mania-note${lb(i)}`);
+  const tailImg = (i, o) => pickAnim(animClock(o.time), vals.get(`NoteImage${i}T`), `mania-note${lb(i)}T`, `mania-note${lb(i)}H`, `mania-note${lb(i)}`);
+  // 长条身体动画官方固定 IsPlaying = false（LegacyBodyPiece）→ 恒显示第 0 帧
+  const bodyImg = (i) => _animEnt(_animPathsAny(vals.get(`NoteImage${i}L`), `mania-note${lb(i)}L`), 0, 1, false);
   // 贴图高 -> unit 高（Height = 纹理高 × WidthForNoteHeightScale / 纹理宽）
   const unitH = (e) => (e && e.w > 0 ? Math.max(1, e.h * refW / e.w) : 44);
   const keyH = (e) => (e && e.h > 0 ? Math.max(1, Math.round(e.h * scale / 1.6)) : 0);
@@ -1341,7 +1730,7 @@ function _drawPlayNotes(P) {
   const lightPaths = _animPaths(vals.get("StageLight"), "mania-stage-light");
   const drawKeyLights = () => {
     if (!_showDefaultOn() || !lightPaths.length) return;
-    const lightEnt = _imgEntLoaded(lightPaths[Math.floor(t / lightFrameLen) % lightPaths.length]);
+    const lightEnt = _animEnt(lightPaths, t, lightFrameLen, true);
     if (!lightEnt || lightEnt.w <= 0) return;
     for (let i = 0; i < keys; i++) {
       let alpha = 1, kScale = 1;
@@ -1355,7 +1744,9 @@ function _drawPlayNotes(P) {
       const rgb = _parseRgba(vals.get(`ColourLight${i + 1}`), [255, 255, 255, 255]).slice(0, 3);
       const tinted = _tintEl(lightEnt.img, rgb);
       if (!tinted) continue;
-      const lh = Math.max(1, wpx * lightEnt.h / lightEnt.w) * kScale;
+      // 官方：灯光 Width = 1（列宽），高度 = 贴图逻辑高（768 空间 → 480 空间 ÷1.6），
+      // 不按贴图宽高比缩放（原项目按列宽等比算高，与官方不符）。
+      const lh = Math.max(1, lightEnt.h * scale / 1.6) * kScale;
       // 官方：BottomCentre 锚在 LightPosition（自下往上生长；倒置时镜像为自顶向下）
       ctx.save();
       ctx.globalAlpha = alpha;
@@ -1400,10 +1791,10 @@ function _drawPlayNotes(P) {
 
   // ═══════════════════════ 音符（下落 / 按住） ═══════════════════════
   // 单个长条的完整绘制（身体 → 头 → 尾）
-  const drawLn = (i, headEdge, tailEdge, held) => {
+  const drawLn = (i, o, headEdge, tailEdge, held) => {
     const wpx = colWpx(i);
     const x = colX(i);
-    const H = headImg(i), T = tailImg(i), L = bodyImg(i);
+    const H = headImg(i, o), T = tailImg(i, o), L = bodyImg(i);
     const hh = unitH(H);            // 头高（unit）
     const th = unitH(T);            // 尾高（unit）
     const hBottom = held ? hitY : headEdge; // 按住时头部前沿钉在判定线
@@ -1473,7 +1864,7 @@ function _drawPlayNotes(P) {
     if (!(o.type & 128) || !(o.endTime > o.time)) {
       if (o.time <= t) continue;            // 已越过判定线 → 消失
       if (headEdge < 0 || headEdge > hitY + 20) continue;
-      const e = noteImg(i);
+      const e = noteImg(i, o);
       const wpx = colWpx(i), x = colX(i);
       if (e && e.w > 0) {
         const nh = unitH(e) * scale;
@@ -1491,7 +1882,7 @@ function _drawPlayNotes(P) {
     if (o.time <= t) continue;
     const tailEdge = posAt(o.endTime);
     if (headEdge < -4 || tailEdge > 484) continue; // 整条仍在屏幕上/下边之外
-    drawLn(i, headEdge, tailEdge, false);
+    drawLn(i, o, headEdge, tailEdge, false);
   }
 
   // 按住中的长条（头已过判定线、尾未到）：头部钉在判定线
@@ -1504,7 +1895,7 @@ function _drawPlayNotes(P) {
       const o = objs[ln.idx];
       const i = Math.floor(o.x * keys / 512);
       if (i < 0 || i >= keys) continue;
-      drawLn(i, hitY, posAt(ln.end), true);
+      drawLn(i, o, hitY, posAt(ln.end), true);
     }
   }
   ctx.restore(); // 结束音符裁剪
@@ -1515,7 +1906,10 @@ function _drawPlayNotes(P) {
 
   // ═══════════════════════ 打击反馈：判定图 + 打击爆炸 ═══════════════════════
   if (ev && ev.n) {
-    const explEnt = pickImg(vals.get("LightingN"), "lightingN");
+    // 打击爆炸动画（官方 LegacyHitExplosion：每次命中 GotoFrame(0)，
+    // 帧长 = max(SIXTY_FRAME_TIME, 170 / 帧数)，不循环，播完停在末帧）
+    const explPaths = _animPathsAny(vals.get("LightingN"), "lightingN");
+    const explFrameLen = Math.max(PLAY_ANIM_60FPS_MS, PLAY_ANIM_EXPLODE_SPAN / Math.max(1, explPaths.length));
     const nWidths = _num_list(vals.get("LightingNWidth"), 0, keys);
     const scorePosU = _num(vals.get("ScorePosition"), 300);
     const span = Math.max(PLAY_EXPLODE_IN + PLAY_EXPLODE_OUT, PLAY_JUDGE_TOTAL);
@@ -1532,34 +1926,61 @@ function _drawPlayNotes(P) {
         ? (ev.i[k] >= half ? [half, cols.length - 1] : [0, half - 1])
         : [0, cols.length - 1];
       const judgeCx = X((cols[stageCols[0]][0] + cols[stageCols[1]][1]) / 2);
+      // 判定图纵向位置（官方 LegacyManiaJudgementPiece.onDirectionChanged）：
+      //   hitPositionFromTop = 480×1.6 - HitPosition（768 空间，即本坐标系下的 hitY）
+      //   ScorePosition > hitPositionFromTop / 2 → 锚点取「远端」，y = 480 - hitY + scorePos
+      //   否则锚点取「近端」，y = scorePos
+      // 倒置时官方的锚点/符号整体镜像，换算回本坐标系（Y() 已负责镜像）后结果相同。
+      const judgeY = scorePosU > hitY / 2 ? 480 - hitY + scorePosU : scorePosU;
       const dt = t - ev.t[k];
       if (dt < PLAY_JUDGE_TOTAL) {
         const res = ev.r[k];
         const files = HIT_LOOKUP[res];
         const iniPath = HIT_INI_KEYS[res] ? vals.get(HIT_INI_KEYS[res]) : null;
+        // 判定图动画：mania-hit* 走官方 ManiaLegacySkinTransformer.getResult
+        // （GetAnimation(filename, true, true, frameLength: 1000/20)，命中时 GotoFrame(0)，
+        // 循环播放）；回退到旧式 hit* 时走 LegacySkin.GetDrawableComponent
+        // （GetAnimation(name, true, false) → SIXTY_FRAME_TIME、不循环、播完停在末帧）
         let jEnt = null;
         if (files) {
-          for (const base of files) { jEnt = pickImg(iniPath, base); if (jEnt) break; }
+          for (const base of files) {
+            const paths = _animPathsAny(iniPath, base);
+            if (!paths.length) continue;
+            const isMania = base.startsWith("mania-hit");
+            jEnt = _animEnt(paths, dt, isMania ? PLAY_ANIM_JUDGE_MS : PLAY_ANIM_60FPS_MS, isMania);
+            if (jEnt) break;
+          }
         }
         if (jEnt && jEnt.w > 0) {
-          const sc = _playJudgeScale(dt);
+          const sc = _playJudgeScale(dt, res);
           const h = (jEnt.h / 1.6) * scale * sc;
           const w = Math.max(1, jEnt.w * h / jEnt.h);
+          const py = Y(judgeY);
           ctx.save();
           ctx.globalAlpha = Math.max(0, Math.min(1, _playJudgeAlpha(dt)));
-          ctx.drawImage(jEnt.img, judgeCx - w / 2, Y(scorePosU) - h / 2, w, h);
+          // miss 额外绕 Centre 旋转到随机角（官方 RotateTo 0 → ±5.73°, 100ms Out）
+          const rot = res === "miss" ? _playJudgeRot(k) * _playJudgeOut(dt) : 0;
+          if (rot) {
+            ctx.translate(judgeCx, py);
+            ctx.rotate(rot * Math.PI / 180);
+            ctx.drawImage(jEnt.img, -w / 2, -h / 2, w, h);
+          } else {
+            ctx.drawImage(jEnt.img, judgeCx - w / 2, py - h / 2, w, h);
+          }
           ctx.restore();
         }
       }
     }
 
     // 打击爆炸（LightingN / ExplosionImage，官方 LegacyHitExplosion：Additive，按列显示）
-    if (explEnt && explEnt.w > 0) {
+    if (explPaths.length) {
       ctx.save();
       ctx.globalCompositeOperation = "lighter";
       for (let k = a; k < b; k++) {
         const dt = t - ev.t[k];
         if (dt < 0 || dt >= PLAY_EXPLODE_IN + PLAY_EXPLODE_OUT) continue;
+        const explEnt = _animEnt(explPaths, dt, explFrameLen, false);
+        if (!explEnt || explEnt.w <= 0) continue;
         const i = ev.i[k];
         const ew = (nWidths[i] > 0 ? nWidths[i] : (cols[i][1] - cols[i][0])) * scale;
         const eh = Math.max(1, explEnt.h * ew / explEnt.w);
@@ -1576,10 +1997,9 @@ function _drawPlayHud(sx, sy, screenW, scale, X, Y, vals, cols) {
   const ctx = _p.ctx;
   const ev = _p.play.events;
   const t = _playTimeMs();
-  const stat = ev && ev.n ? _playStatsAt(ev, t) : { combo: 0, score: 0, acc: 100 };
+  const stat = ev && ev.n ? _playStatsAt(ev, t) : { combo: 0, score: 0, acc: 100, hp: 1, k: 0 };
   const stageLeft = cols[0][0], stageRight = cols[cols.length - 1][1];
-
-  _drawScorebar(X(stageRight), sy + 480 * scale, scale);
+  _drawScorebar(X(stageRight), sy + 480 * scale, scale, stat, ev, t);
 
   const scorePrefix = _fontPrefix("ScorePrefix", "score");
   const comboPrefix = _fontPrefix("ComboPrefix", "combo");
@@ -1587,10 +2007,15 @@ function _drawPlayHud(sx, sy, screenW, scale, X, Y, vals, cols) {
   const scoreH = (scoreImg ? scoreImg.h : 26) / 1.6 * scale;
   const scoreOverlap = _num(state.ini.get("Fonts", "ScoreOverlap"), 0) / 1.6 * scale;
   const hudRight = 14 / 1.6 * scale;
-  _drawNumber(String(stat.score).padStart(8, "0"), scorePrefix,
-    sx + screenW - hudRight, sy + 10 / 1.6 * scale, "right", scoreH, scoreOverlap, "score-0");
-  _drawNumber(`${stat.acc.toFixed(2)}%`, scorePrefix,
-    sx + screenW - hudRight, sy + 45 / 1.6 * scale, "right", scoreH * 0.6, scoreOverlap);
+  // 官方 RollingCounter：分数 1000ms / 准确率 375ms 滚动到新值，不随判定瞬间跳变
+  const scoreShown = Math.round(_playRoll("score", stat.score, PLAY_ROLL_SCORE_MS, t));
+  const accShown = _playRoll("acc", stat.acc, PLAY_ROLL_ACC_MS, t);
+  // 官方 LegacyScoreCounter / LegacyAccuracyCounter 的 LegacySpriteText 均为 FixedWidth：
+  // 数字等宽步进，否则数值滚动时整串宽度会随数字（如 7 比其他数字窄）来回伸缩
+  _drawNumber(String(scoreShown).padStart(8, "0"), scorePrefix,
+    sx + screenW - hudRight, sy + 10 / 1.6 * scale, "right", scoreH, scoreOverlap, "score-0", null, 1, true);
+  _drawNumber(`${accShown.toFixed(2)}%`, scorePrefix,
+    sx + screenW - hudRight, sy + 45 / 1.6 * scale, "right", scoreH * 0.6, scoreOverlap, null, null, 1, true);
 
   // 连击计数（场地水平居中，ComboPosition 为数字中心 Y；0 连不显示）
   const comboY = _num(vals.get("ComboPosition"), 111);
@@ -1627,9 +2052,24 @@ function _drawPlayHud(sx, sy, screenW, scale, X, Y, vals, cols) {
   }
 
   if (stat.combo > 0) {
+    // 官方 onCountIncrement：连击 +1 时数字瞬时纵向拉伸到 1.4，再 300ms 缓动回 1
+    const punch = _playComboPunchScale(ev, t, stat.combo);
     _drawNumber(String(stat.combo), comboPrefix,
-      comboCx, comboCy - comboH / 2, "center", comboH, comboOverlap, "combo-0");
+      comboCx, comboCy - comboH / 2, "center", comboH, comboOverlap, "combo-0", null, punch);
   }
+}
+
+/** 连击数字的官方跳动系数（LegacyManiaComboCounter.onCountIncrement）：
+ * 连击 +1 时瞬时 ScaleTo(1, 1.4)，随后 300ms Easing.Out（二次）回到 (1, 1)。
+ * 仅当正在显示的连击数就是最近一次判定加出来的连击时生效，其余情况为 1。 */
+function _playComboPunchScale(ev, t, combo) {
+  if (!ev || !ev.n || combo <= 0) return 1;
+  const k = bisectLeft(ev.t, t);
+  if (k <= 0 || ev.pCombo[k] !== combo) return 1;
+  const dt = t - ev.t[k - 1];
+  if (dt < 0 || dt >= PLAY_COMBO_PUNCH_MS) return 1;
+  const ease = 1 - Math.pow(1 - dt / PLAY_COMBO_PUNCH_MS, 2);
+  return 1 + (PLAY_COMBO_PUNCH_SCALE_Y - 1) * (1 - ease);
 }
 
 // ---------------------------------------------------------------------------
@@ -1637,8 +2077,8 @@ function _drawPlayHud(sx, sy, screenW, scale, X, Y, vals, cols) {
 // ---------------------------------------------------------------------------
 
 function _draw(ctx, cw, ch) {
-  const page = _pv("page", "游玩界面");
-  const play = !!(_p.play && _p.play.bm) && page === "动态预览";
+  const page = _pv("page", "静态游玩预览");
+  const play = !!(_p.play && _p.play.bm) && page === "动态游玩预览";
   const playKeys = play ? Math.max(1, Math.min(18, _p.play.keys)) : null;
   const vals = _collectValues(playKeys);
   const keys = playKeys || Math.max(1, Math.min(18, parseInt(_num(vals.get("Keys"), 4), 10) || 4));
@@ -1747,7 +2187,7 @@ function _draw(ctx, cw, ch) {
   }
 
   // 失败界面：独立新开一块屏幕（不绘制游玩画面与血条）
-  if (_pv("page", "游玩界面") === "失败界面") {
+  if (_pv("page", "静态游玩预览") === "失败界面") {
     _drawFail(sx, sy, screenW, screenH, scale);
     return;
   }
@@ -1758,25 +2198,38 @@ function _draw(ctx, cw, ch) {
   for (let i = 0; i < cols.length; i++) {
     const [x0, x1] = cols[i];
     const rgba = _parseRgba(vals.get(`Colour${i + 1}`), [0, 0, 0, 255]);
-    const fill = rgba[3] > 0 ? rgb_to_hex(rgba.slice(0, 3)) : "#1c1c22";
-    ctx.fillStyle = fill;
+    // 官方 LegacyStageBackground：列底色走 ApplyWithDoubledAlpha → 最终 alpha = (A/255)²，
+    // A = 0 时完全不可见（原项目在此丢弃 alpha，且给 A = 0 兜底了 #1c1c22，均与官方不符）。
+    const bgAlpha = _doubledAlpha(rgba);
+    if (bgAlpha <= 0) continue;
+    ctx.save();
+    ctx.globalAlpha = bgAlpha;
+    ctx.fillStyle = rgb_to_hex(rgba.slice(0, 3));
     ctx.fillRect(X(x0), fieldTop, (x1 - x0) * scale, fieldH);
+    ctx.restore();
   }
 
   // 血条（屏幕级 HUD）：移至舞台装饰之后绘制，避免被舞台底部/左右边框遮挡，
   // 与官方一致（HUD 位于 StageForeground 层之上）。贴屏幕底边、锚定最右轨道右侧，
   // 倒置时不随舞台翻转。绘制位置见下方 HUD 区块（与分数/连击同层）。
   // 列分隔线（xK 共 x+1 条）
+  // 官方 LegacyStageBackground 的列线 Container：Scale = (0.740, 1)（宽度 ×0.740，纵向不缩），
+  // 且包在 HitTargetInsetContainer 内（Down 时底边内缩到判定线、Up 时顶边内缩到判定线）
+  // → 纵向只画到判定线，不铺满全高。颜色同样走 ApplyWithDoubledAlpha（最终 alpha = (A/255)²）。
+  const colLineAlpha = _doubledAlpha(colLine);
   const lineXs = [cols[0][0]].concat(cols.map((c) => c[1]));
   for (let j = 0; j < lineXs.length; j++) {
-    const lw = Math.max(0, lineWidths[j]) * scale;
-    if (!colLineColor || lw <= 0) continue;
+    const lw = Math.max(0, lineWidths[j]) * PLAY_COL_LINE_SCALE * scale;
+    if (!colLineColor || colLineAlpha <= 0 || lw <= 0) continue;
+    ctx.save();
+    ctx.globalAlpha = colLineAlpha;
     ctx.strokeStyle = colLineColor;
     ctx.lineWidth = Math.max(1, Math.round(lw));
     ctx.beginPath();
     ctx.moveTo(X(lineXs[j]), Y(0));
-    ctx.lineTo(X(lineXs[j]), Y(480));
+    ctx.lineTo(X(lineXs[j]), Y(hitY));
     ctx.stroke();
+    ctx.restore();
   }
 
   // 小节线（barline）：官方 LegacyBarLine 用 Height = BarlineHeight ?? 1.2、Colour = ColourBarline ?? 白，
@@ -1831,10 +2284,13 @@ function _draw(ctx, cw, ch) {
       const colLight = _parseRgba(vals.get(`ColourLight${i + 1}`), [55, 255, 255, 255]);
       const tinted = lightEnt ? _tintEl(lightEnt.img, colLight.slice(0, 3)) : null;
       if (tinted) {
+        // 官方 LegacyColumnBackground：灯光 RelativeSizeAxes = X / Width = 1（宽 = 列宽）、
+        // 高度 = 贴图逻辑高（768 空间 → 480 空间 ÷1.6），容器锚在 LightPosition 向上生长。
         const lw = (x1 - x0) * scale;
-        const lh = 30 * scale;
-        _drawEl(tinted, X(x0), Y(lightY) - 15 * scale, lw, lh);
-        _pick("mania-stage-light", X(x0), Y(lightY) - 15 * scale, lw, lh);
+        const lh = Math.max(1, lightEnt.h * scale / 1.6);
+        const ly = upside ? Y(lightY) : Y(lightY) - lh;
+        _drawEl(tinted, X(x0), ly, lw, lh);
+        _pick("mania-stage-light", X(x0), ly, lw, lh);
       }
     }
   }
@@ -1880,17 +2336,16 @@ function _draw(ctx, cw, ch) {
     for (const [sl, sr] of stageRanges) {
       const sw = sr - sl;
       const hEnt = hintPath ? _imgEntLoaded(hintPath) : null;
-      if (hEnt && hEnt.w > 0) {
-        // 判定线高度按图片宽高比缩放，但 1x1 占位图会把高度撑成与宽度等大
-        // （th = sw*scale 的巨大方形），既影响观感也导致框选范围/高亮框错误。
-        // 故限制高度不超过一个合理上限（按舞台宽的 20%，通常判定线远细于此）。
-        const th = Math.max(1, Math.min(
-          Math.round(hEnt.h * sw * scale / hEnt.w),
-          Math.round(sw * scale * 0.2),
-        ));
-        const cx = X((sl + sr) / 2) - sw * scale / 2;
-        const cy = Y(hitY) - th / 2;
-        _drawEnt(hEnt, cx, cy, sw * scale, th);
+      // 官方 LegacyHitTarget：提示线贴图 RelativeSizeAxes = X（宽 = 舞台宽，不按比例），
+      // Scale = (1, 0.9 × 1.6025)（768 空间 → 480 空间再 ÷1.6）；
+      // 其容器 Origin = CentreLeft + Anchor = BottomLeft（下）/ TopLeft（上）、AutoSizeAxes = Y，
+      // 即贴图以判定线为**垂直中心**（不是底边贴线），上方向再整体纵向镜像（Scale = (1, -1)）。
+      // 原项目按舞台宽等比算高（1x1 占位图会撑成巨大方块）并额外加了 20% 上限，均与官方不符。
+      const th = hEnt && hEnt.w > 0 ? Math.max(1, hEnt.h * PLAY_HINT_SCALE_Y * scale) : 0;
+      const cx = X((sl + sr) / 2) - sw * scale / 2;
+      const cy = Y(hitY) - th / 2;
+      if (th > 0) {
+        _drawEnt(hEnt, cx, cy, sw * scale, th, false, upside);
         hintPicks.push({ cx, cy, w: sw * scale, h: th });
       } else {
         ctx.strokeStyle = judgeLineColor;
@@ -1900,15 +2355,20 @@ function _draw(ctx, cw, ch) {
         ctx.lineTo(X(sr), Y(hitY));
         ctx.stroke();
       }
-      // 额外的判定提示线（JudgementLine 命令）——无论 stage-hint 图片是否存在都绘制
-      // （与原项目一致：置于 if/else 之外，独立于舞台提示线）
+      // 判定提示线（JudgementLine 命令）——与提示线贴图同容器、Anchor = CentreLeft
+      // （竖直方向与贴图中心对齐 = 判定线本身）；Height = 1（768 空间 → 480 空间 0.625）、
+      // Alpha = 0.9，颜色经 DisallowZeroAlpha（A = 0 时按 1 处理，仍按 0.9 显示）。
       if (_bool(vals.get("JudgementLine"))) {
+        const jlA = judgeLine[3] === 0 ? 1 : judgeLine[3] / 255;
+        ctx.save();
+        ctx.globalAlpha = PLAY_JUDGE_LINE_ALPHA * jlA;
         ctx.strokeStyle = judgeLineColor;
-        ctx.lineWidth = 1;
+        ctx.lineWidth = Math.max(1, PLAY_JUDGE_LINE_H * scale);
         ctx.beginPath();
         ctx.moveTo(X(sl), Y(hitY));
         ctx.lineTo(X(sr), Y(hitY));
         ctx.stroke();
+        ctx.restore();
       }
     }
   };
@@ -2208,7 +2668,7 @@ function _draw(ctx, cw, ch) {
 
   if (!play) {
     // 页面切换：游玩界面在 HUD 之上绘制“跳过”按钮；暂停界面绘制覆盖层
-    if (page === "游玩界面") _drawPlaySkip(sx, sy, screenW, screenH, scale);
+    if (page === "静态游玩预览") _drawPlaySkip(sx, sy, screenW, screenH, scale);
     if (page === "暂停界面") _drawPause(sx, sy, screenW, screenH, scale);
   }
 }
@@ -2394,7 +2854,7 @@ function _buildBar() {
     o.textContent = p;
     sel.appendChild(o);
   }
-  sel.value = _pv("page", "游玩界面");
+  sel.value = _pv("page", "静态游玩预览");
   sel.addEventListener("change", () => _onPageChange(sel.value));
   bar.appendChild(sel);
   _p.pageSel = sel;
@@ -2462,7 +2922,7 @@ function _buildBar() {
   return bar;
 }
 
-/** 构建动态预览控制行（歌曲名 / 播放 / 进度条 / 下落速度）。
+/** 构建动态预览控制行（歌曲名 / 播放 / 进度条 / 倍速 / 下落速度）。
  * 由 renderPreview 按设置 play_bar_pos 放到工具栏内（画布上方）或画布下方。 */
 function _buildPlayCtl() {
   const playCtl = document.createElement("div");
@@ -2473,6 +2933,9 @@ function _buildPlayCtl() {
     <button class="btn btn-tool preview-btn-sm preview-play-btn">▶ 播放</button>
     <input type="range" class="preview-progress" min="0" max="1" step="1" value="0">
     <span class="preview-play-time">0:00 / 0:00</span>
+    <label class="preview-speed"><span>倍速</span>
+      <select class="preview-rate-sel">${PLAY_RATES.map((r) => `<option value="${r}">${r}×</option>`).join("")}</select>
+    </label>
     <label class="preview-speed"><span>下落速度</span>
       <input type="range" class="preview-speed-sel" min="${PLAY_SPEED_MIN}" max="${PLAY_SPEED_MAX}" step="1">
       <span class="preview-speed-val"></span>
@@ -2487,13 +2950,16 @@ function _buildPlayCtl() {
   t.timeLbl = playCtl.querySelector(".preview-play-time");
   t.speedSel = playCtl.querySelector(".preview-speed-sel");
   t.speedVal = playCtl.querySelector(".preview-speed-val");
+  t.rateSel = playCtl.querySelector(".preview-rate-sel");
   t.fsBtn = playCtl.querySelector(".preview-fs-btn");
   t.speedSel.value = String(t.speed);
   t.speedVal.textContent = String(t.speed);
+  t.rateSel.value = String(t.rate);
   t.playBtn.addEventListener("click", () => _playToggle());
   t.progress.addEventListener("input", () => { if (t.progress.value !== "") _playSeek(Number(t.progress.value)); });
   t.speedSel.addEventListener("input", () => _playSetSpeed(t.speedSel.value));
   t.speedSel.addEventListener("change", () => persistSettings()); // 松手时把下落速度写进设置
+  t.rateSel.addEventListener("change", () => { _playSetRate(t.rateSel.value); persistSettings(); });
   t.fsBtn.addEventListener("click", () => _togglePlayFullscreen());
   return playCtl;
 }
@@ -2503,9 +2969,9 @@ function _onPageChange(page) {
   state.preview.page = page;
   _commitPreview();
   emit("preview:page-changed");
-  const playMode = page === "动态预览";
+  const playMode = page === "动态游玩预览";
   const p = _p.play;
-  // 控制行（歌曲名 / 播放 / 进度条 / 下落速度）：仅动态预览且有谱面时显示
+  // 控制行（歌曲名 / 播放 / 进度条 / 倍速 / 下落速度）：仅动态预览且有谱面时显示
   if (p && p.ctl) p.ctl.hidden = !(playMode && p.bm);
   if (playMode && p && p.bm) {
     _schedulePlayLoop();
@@ -2523,7 +2989,7 @@ function _playSwitchTo(page) {
 }
 
 function _syncBar() {
-  if (_p.pageSel) _p.pageSel.value = _pv("page", "游玩界面");
+  if (_p.pageSel) _p.pageSel.value = _pv("page", "静态游玩预览");
   if (_p.aspectSel) {
     _p.aspectSel.querySelectorAll("button").forEach((b) => {
       b.classList.toggle("active", b.dataset.val === state.preview.aspect);
@@ -2535,7 +3001,7 @@ function _syncBar() {
 function _syncPlayCtl() {
   const p = _p.play;
   if (!p || !p.ctl) return;
-  const onPlay = _pv("page", "游玩界面") === "动态预览" && !!p.bm;
+  const onPlay = _pv("page", "静态游玩预览") === "动态游玩预览" && !!p.bm;
   p.ctl.hidden = !onPlay;
   if (onPlay && !p.raf) _schedulePlayLoop();
   // 离开动态预览（或谱面被清空）时自动退出全屏播放：否则工具栏被隐藏、无退出入口
@@ -2702,8 +3168,9 @@ function _openValueDialog() {
 
 /** 渲染预览区：控制栏 + 画布。 */
 export function renderPreview() {
-  // 兼容旧设置：页面「对局预览」已更名为「动态预览」，否则旧 settings.json 的旧值会与下拉失配
-  if (state.preview.page === "对局预览") state.preview.page = "动态预览";
+  // 兼容旧设置：页面旧名（对局预览 / 动态预览 / 游玩界面）迁移到新名，否则旧 settings.json 的旧值会与下拉失配
+  const PAGE_ALIAS = { "对局预览": "动态游玩预览", "动态预览": "动态游玩预览", "游玩界面": "静态游玩预览" };
+  if (PAGE_ALIAS[state.preview.page]) state.preview.page = PAGE_ALIAS[state.preview.page];
   const host = document.getElementById("preview-pane");
   host.innerHTML = "";
   host.className = "preview-host";
