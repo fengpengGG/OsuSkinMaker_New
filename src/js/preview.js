@@ -901,9 +901,9 @@ function _drawHoldBody(ctx, ent, dx, dw, top, bottom, tile, style, flipV) {
 
 /** 合成长条 body 图（带缓存）。样式 0~4 语义见 _holdBodyAnchors。
  * 画布按「上 = 面尾、下 = 面头」的下落朝向生成，绘制时再由 flipNotes 决定是否镜像。
- * ColourHold 覆盖颜色。 */
-function _buildHoldBody(bodyPath, noteBodyStyle, bodyW, targetH, noteRefW, scale, holdRgba) {
-  const key = `${bodyPath}|${noteBodyStyle}|${Math.round(bodyW)}|${Math.round(targetH)}|${noteRefW}|${scale}|${holdRgba.slice(0, 3).join(",")}`;
+ * 长条身体颜色由贴图本身决定（ColourHold 在官方语义中是连击计数器颜色，不作用于身体）。 */
+function _buildHoldBody(bodyPath, noteBodyStyle, bodyW, targetH, noteRefW, scale) {
+  const key = `${bodyPath}|${noteBodyStyle}|${Math.round(bodyW)}|${Math.round(targetH)}|${noteRefW}|${scale}`;
   const hit = _p.holdCache.get(key);
   if (hit) return hit;
   const ent = _imgEntLoaded(bodyPath);
@@ -916,11 +916,6 @@ function _buildHoldBody(bodyPath, noteBodyStyle, bodyW, targetH, noteRefW, scale
   // 单张平铺高度 = 贴图按基准宽(noteRefW)等比缩放后的高度 × 像素倍率
   const tile = Math.max(1, (ent.h * noteRefW / iw) * scale);
   _drawHoldBody(g, ent, 0, c.width, 0, c.height, tile, noteBodyStyle, false);
-  // ColourHold 覆盖长条身体颜色（默认白色 = 不变，跳过乘算避免重建；
-  // 与 PIL ImageChops.multiply 一致：仅乘 RGB、保持 alpha，透明区不染色）
-  if (holdRgba[0] !== 255 || holdRgba[1] !== 255 || holdRgba[2] !== 255) {
-    _multiplyTint(g, c.width, c.height, holdRgba);
-  }
   const out = { canvas: c, srcW: iw };
   _p.holdCache.set(key, out);
   return out;
@@ -1332,7 +1327,8 @@ function _playRoll(key, target, dur, t) {
 async function _importBeatmap() {
   let files = [];
   try {
-    files = await invoke("pick_files");
+    // 起始目录用上次导入铺面的目录（设置记忆，无需重新翻文件夹）
+    files = await invoke("pick_files", { initialDir: _lastBeatmapDir() });
   } catch (e) {
     toast(`导入铺面失败：${e.message || e}`, "error");
     return;
@@ -1340,6 +1336,13 @@ async function _importBeatmap() {
   const osuPath = files.find((f) => /\.osu$/i.test(f));
   if (!osuPath) { toast("未选择 .osu 谱面文件", "error"); return; }
   await _loadBeatmap(osuPath, files, false);
+}
+
+/** 上次导入铺面的目录（设置记忆；兼容旧版仅记 last_beatmap 的情况，取其所在目录）。 */
+function _lastBeatmapDir() {
+  if (state.settings.last_beatmap_dir) return state.settings.last_beatmap_dir;
+  const b = state.settings.last_beatmap;
+  return b ? b.replace(/[\\/][^\\/]*$/, "") : "";
 }
 
 /**
@@ -1413,8 +1416,10 @@ async function _loadBeatmap(osuPath, files, restore) {
   toast(`${restore ? "已恢复上次谱面" : "已导入"}：${bm.title}（${p.keys}K / ${Math.round(bm.bpm)}BPM / ${bm.noteCount} 音符${bm.lnCount ? " +" + bm.lnCount + " 长条" : ""}${audioPath ? "，已带音频" : "，无音频"}）`);
   if (!restore) {
     state.settings.last_beatmap = osuPath; // 记住谱面，下次启动自动恢复
+    state.settings.last_beatmap_dir = dir; // 记住所在目录，下次导入铺面对话框定位到这里
     persistSettings();
     _playSwitchTo("动态游玩预览");
+    emit("beatmap:imported", { keys: p.keys }); // 通知 skin.ini 编辑器跳转到该铺面的键数
   }
   _schedulePlayLoop();
   return true;
@@ -1711,6 +1716,8 @@ function _drawPlayNotes(P) {
       for (let k = a2; k < b2; k++) colHit[ev.i[k]] = Math.max(colHit[ev.i[k]], ev.t[k]);
     }
   }
+  // 是否有长条处于按住状态（官方 stable：按住 LN 期间连击计数器用 ColourHold 着色）
+  play.anyHeld = colHeld.some((v) => v);
   const colPressed = new Array(keys).fill(false);
   const colDown = new Array(keys).fill(false); // 按下图可见性（官方松开后额外延迟 80ms）
   for (let i = 0; i < keys; i++) {
@@ -1741,7 +1748,7 @@ function _drawPlayNotes(P) {
         kScale = 1 - r;
       }
       const wpx = colWpx(i);
-      const rgb = _parseRgba(vals.get(`ColourLight${i + 1}`), [255, 255, 255, 255]).slice(0, 3);
+      const rgb = _parseRgba(vals.get(`ColourLight${i + 1}`), [55, 255, 255, 255]).slice(0, 3);
       const tinted = _tintEl(lightEnt.img, rgb);
       if (!tinted) continue;
       // 官方：灯光 Width = 1（列宽），高度 = 贴图逻辑高（768 空间 → 480 空间 ÷1.6），
@@ -2054,8 +2061,15 @@ function _drawPlayHud(sx, sy, screenW, scale, X, Y, vals, cols) {
   if (stat.combo > 0) {
     // 官方 onCountIncrement：连击 +1 时数字瞬时纵向拉伸到 1.4，再 300ms 缓动回 1
     const punch = _playComboPunchScale(ev, t, stat.combo);
+    // 官方 stable：按住长条（LN）期间连击计数器用 ColourHold 着色（默认橙金 255,191,51），
+    // 松开恢复贴图原色；alpha = 0 时视为完全透明（不着色）。
+    let holdTint = null;
+    if (_p.play.anyHeld) {
+      const hrgb = _parseRgba(vals.get("ColourHold"), [255, 191, 51, 255]);
+      if (hrgb[3] > 0) holdTint = hrgb.slice(0, 3);
+    }
     _drawNumber(String(stat.combo), comboPrefix,
-      comboCx, comboCy - comboH / 2, "center", comboH, comboOverlap, "combo-0", null, punch);
+      comboCx, comboCy - comboH / 2, "center", comboH, comboOverlap, "combo-0", holdTint, punch);
   }
 }
 
@@ -2238,24 +2252,18 @@ function _draw(ctx, cw, ch) {
   const barlineRgba = _parseRgba(vals.get("ColourBarline"), [255, 255, 255, 255]);
   const barlineH = Math.max(0, _num(vals.get("BarlineHeight"), 1.2)) * scale;
   const drawBarLine = (u) => {
+    // 官方 LegacyBarLine：Colour = ColourBarline（不经 DoubledAlpha，alpha 直接生效）、
+    // Height = BarlineHeight。故 A = 0 时颜色完全透明、Height = 0 时高度为 0，均不可见。
+    if (barlineRgba[3] <= 0 || barlineH <= 0) return;
     const y = Y(u);
-    if (barlineRgba[3] <= 0) {
-      ctx.strokeStyle = "#888888";
-      ctx.lineWidth = 1;
-      ctx.setLineDash([4, 4]);
-    } else if (barlineH > 0) {
-      ctx.strokeStyle = rgb_to_hex(barlineRgba.slice(0, 3));
-      ctx.lineWidth = Math.max(1, Math.round(barlineH));
-    } else {
-      return;
-    }
+    ctx.strokeStyle = rgb_to_hex(barlineRgba.slice(0, 3));
+    ctx.lineWidth = Math.max(1, Math.round(barlineH));
     for (let i = 0; i < cols.length; i++) {
       ctx.beginPath();
       ctx.moveTo(X(cols[i][0]), y);
       ctx.lineTo(X(cols[i][1]), y);
       ctx.stroke();
     }
-    if (barlineRgba[3] <= 0) ctx.setLineDash([]);
   };
   const bmLines = play && _p.play.bm ? _p.play.bm.barLines : null;
   if (bmLines && bmLines.length) {
@@ -2358,7 +2366,10 @@ function _draw(ctx, cw, ch) {
       // 判定提示线（JudgementLine 命令）——与提示线贴图同容器、Anchor = CentreLeft
       // （竖直方向与贴图中心对齐 = 判定线本身）；Height = 1（768 空间 → 480 空间 0.625）、
       // Alpha = 0.9，颜色经 DisallowZeroAlpha（A = 0 时按 1 处理，仍按 0.9 显示）。
-      if (_bool(vals.get("JudgementLine"))) {
+      // 官方 LegacyManiaSkinConfiguration.ShowJudgementLine 默认 true（缺省也显示判定线），
+      // 因此只有字段存在且值非 "1"（如 JudgementLine: 0 / 留空）时才隐藏。
+      const showJL = vals.has("JudgementLine") ? _bool(vals.get("JudgementLine")) : true;
+      if (showJL) {
         const jlA = judgeLine[3] === 0 ? 1 : judgeLine[3] / 255;
         ctx.save();
         ctx.globalAlpha = PLAY_JUDGE_LINE_ALPHA * jlA;
@@ -2443,11 +2454,10 @@ function _draw(ctx, cw, ch) {
   const headCxY = hitY - (headH / scale) / 2;
   const lnTop = headCxY - lnLen;
 
-  // 身体
+  // 身体（颜色由贴图本身决定，ColourHold 不作用于身体）
   const bodyPath = _resolvePath(vals.get(`NoteImage${ln}L`), `mania-note${layout[ln]}L`);
-  const holdRgba = _parseRgba(vals.get("ColourHold"), [255, 255, 255, 255]);
   const bodyOut = bodyPath
-    ? _buildHoldBody(bodyPath, noteBodyStyle, lnW, lnLen * scale, refW, scale, holdRgba)
+    ? _buildHoldBody(bodyPath, noteBodyStyle, lnW, lnLen * scale, refW, scale)
     : null;
   const bodyCanvas = bodyOut ? bodyOut.canvas : null;
 

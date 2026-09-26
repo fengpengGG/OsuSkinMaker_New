@@ -40,7 +40,8 @@ export function applyUiScale(scale) {
 async function cmdOpenSkin() {
   let folder = null;
   try {
-    folder = await invoke("pick_folder");
+    // 起始目录用上次打开的皮肤路径（last_skin 随打开皮肤自动更新），无需重新翻文件夹
+    folder = await invoke("pick_folder", { initialDir: state.settings.last_skin });
   } catch (e) {
     return toast("当前为非 Tauri 环境，无法选择文件夹", "error");
   }

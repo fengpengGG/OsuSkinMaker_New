@@ -59,6 +59,8 @@ const DEFAULT_SETTINGS = {
   // 动态预览播放倍速（整条时间轴与音乐同步变速，1 = 原速）
   play_rate: 1,
   last_beatmap: "",
+  // 上次导入铺面所在目录（对话框起始目录；打开皮肤目录见 last_skin）
+  last_beatmap_dir: "",
   // 窗口状态（与原项目字段一致）：无记录时默认最大化
   window_state: "zoomed",  // "zoomed" | "normal"
   window_geometry: null,   // { width, height, x, y } 物理像素
@@ -130,6 +132,7 @@ function _sanitize(settings) {
   // 播放倍速：只接受预设档位，非法值回落到原速
   out.play_rate = PLAY_RATES.includes(Number(out.play_rate)) ? Number(out.play_rate) : DEFAULT_SETTINGS.play_rate;
   if (typeof out.last_beatmap !== "string") out.last_beatmap = DEFAULT_SETTINGS.last_beatmap;
+  if (typeof out.last_beatmap_dir !== "string") out.last_beatmap_dir = DEFAULT_SETTINGS.last_beatmap_dir;
   if (typeof out.preview !== "object" || !out.preview) out.preview = { ...state.preview };
   else out.preview = { ...state.preview, ...out.preview };
   if (typeof out.expanded !== "object" || !out.expanded) out.expanded = {};

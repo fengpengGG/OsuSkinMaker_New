@@ -64,6 +64,17 @@ export function renderIniTab() {
 
   // 元素管理双击缺失元素 → 跳到对应字段
   on("jump-to-ini", jumpToField);
+  // 导入铺面后 skin.ini 编辑器自动跳转到该铺面的键数（Mania 子标签）
+  on("beatmap:imported", ({ keys }) => {
+    const k = parseInt(keys, 10);
+    if (!Number.isFinite(k) || k < 1 || k > 18) return;
+    _t.keysVar = String(k);
+    const sel = document.querySelector(".mania-keys");
+    if (sel) sel.value = String(k); // 下拉框 value 仅在构建时设置，需同步（预览 _currentKeys 读它）
+    _rebuildManiaBody();
+    _switchSubTab("mania");
+    emit("ini:changed"); // 与手动切换键数一致：通知预览按新键数重绘
+  });
   // 皮肤打开/重新扫描后，skin.ini 内容可能更新，重新载入全部字段
   on("skin:reloaded", reloadAll);
   // 仅"打开皮肤"才重置键数为 4K（对齐原项目硬约束）；"重新扫描 skin.ini" 应保留当前键数
@@ -100,7 +111,8 @@ function _buildField(container, cmd, getter, setter) {
   const label = document.createElement("span");
   label.className = "field-label";
   label.textContent = cmd.label;
-  label.title = cmd.help || "";
+  // 悬浮提示 = skin.ini 字段名（cmd.key）+ 作用说明（cmd.help）
+  label.title = cmd.help ? `${cmd.key}（${cmd.help}）` : cmd.key;
   row.appendChild(label);
 
   const ctrl = document.createElement("div");

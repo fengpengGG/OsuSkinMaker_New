@@ -226,21 +226,30 @@ pub fn write_text_atomic(path: String, text: String, encoding: String) -> Result
 // ---------------------------------------------------------------------------
 
 /// 选择文件夹，返回绝对路径；取消返回 None。
+/// `initial_dir` 为可选起始目录（前端记忆的上次路径），目录不存在时忽略。
 #[tauri::command]
-pub async fn pick_folder(app: tauri::AppHandle) -> Option<String> {
+pub async fn pick_folder(app: tauri::AppHandle, initial_dir: Option<String>) -> Option<String> {
     use tauri_plugin_dialog::DialogExt;
-    app.dialog()
-        .file()
+    let mut builder = app.dialog().file();
+    if let Some(dir) = initial_dir.filter(|d| Path::new(d).is_dir()) {
+        builder = builder.set_directory(dir);
+    }
+    builder
         .blocking_pick_folder()
         .and_then(|p| p.into_path().ok())
         .map(|pb| pb.display().to_string())
 }
 
 /// 选择多个文件（导入素材用），返回绝对路径列表；取消返回空数组。
+/// `initial_dir` 为可选起始目录（前端记忆的上次路径），目录不存在时忽略。
 #[tauri::command]
-pub async fn pick_files(app: tauri::AppHandle) -> Vec<String> {
+pub async fn pick_files(app: tauri::AppHandle, initial_dir: Option<String>) -> Vec<String> {
     use tauri_plugin_dialog::DialogExt;
-    let picked = app.dialog().file().blocking_pick_files();
+    let mut builder = app.dialog().file();
+    if let Some(dir) = initial_dir.filter(|d| Path::new(d).is_dir()) {
+        builder = builder.set_directory(dir);
+    }
+    let picked = builder.blocking_pick_files();
     picked
         .map(|files| {
             files
